@@ -2,6 +2,8 @@
 
 ImprovedVBGS is a continual updates rather than gradients the create scenes. It imrpoves upon VBGS by adding sparse top-M responsibility inference, and supports adaptive Gaussian insertion/reassignment for new observations.
 
+![Lego reconstruction](Lego.png)
+
 ## Install
 
 Requirements: Python 3.11, CUDA-capable GPU, JAX CUDA build.
@@ -118,7 +120,7 @@ python src/vbgs/scripts/train_tum.py \
   --no-densify \
   --no-reassign \
   --eval
-```
+
 
 ## References
 
