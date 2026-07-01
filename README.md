@@ -10,7 +10,8 @@ training, 21.42 dB validation PSNR.
 
 ![TUM RGB-D prediction](Tum.png)
 
-Current TUM `freiburg1_desk` 200-train-frame run.
+Current TUM `freiburg1_desk` 100k-component unified run, highest-PSNR
+validation prediction.
 
 ## Install
 
