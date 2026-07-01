@@ -1,6 +1,6 @@
 # Improved Variational Bayes Gaussian Splatting
 
-ImprovedVBGS is a continual updates rather than gradients the create scenes. It imrpoves upon VBGS by adding sparse top-M responsibility inference, and supports adaptive Gaussian insertion/reassignment for new observations.
+ImprovedVBGS is a continual updates rather than gradients the create scenes. It improves upon VBGS by adding sparse top-M responsibility inference, and supports adaptive Gaussian insertion/reassignment for new observations.
 
 ![Lego reconstruction](Lego.png)
 
