@@ -52,8 +52,7 @@ def random_mean_init(
             minval=-1.70,
             maxval=1.70,
         )
-        # initialize the color values on zeros (for normal distribution)
-        # this is a good thing. At the center
+        # Keep random spatial initialization from introducing arbitrary colors.
         mean_init = mean_init.at[:, 3:6].set(0)
     else:
         # Initialize the components around the points from the data

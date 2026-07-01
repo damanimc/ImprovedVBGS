@@ -342,7 +342,7 @@ def _compute_topm_stats(initial_model, xi, top_m):
     sems = None
     if dsem is not None:
         sems = _scatter_mvn_stats(idx, posteriors, dsem, n_components)
-    return ps, ss, cs, sems
+    return ps, ss, cs, sems, logsumexp(logprob, axis=-1)
 
 
 compute_topm_stats = jax.jit(_compute_topm_stats, static_argnames=("top_m",))
@@ -479,7 +479,7 @@ def _compute_candidate_topm_stats_cached(
     sems = None
     if dsem is not None:
         sems = _scatter_mvn_stats(idx, posteriors, dsem, n_components)
-    return ps, ss, cs, sems
+    return ps, ss, cs, sems, logsumexp(logprob, axis=-1)
 
 
 compute_candidate_topm_stats_cached = jax.jit(
@@ -534,15 +534,16 @@ def fit_gmm_step(
     top_m=None,
     candidate_indices=None,
     topm_cache=None,
+    low_elbo_count=0,
 ):
     """
     Compute a single update step for the `DeltaMixture` using the assignments
     upon the initial model, but adding the sst to the model.
 
-    :param initial_model: DeltaMixture before having applied a single udpate
+    :param initial_model: DeltaMixture before having applied a single update
     :param model: DeltaMixture of the model having applied the previous updates
-                  is used to apply the upate upon
-    :param data: The data to fit the model to. Preferrably a numpy array, to
+                  is used to apply the update upon
+    :param data: The data to fit the model to. Preferably a numpy array, to
                  only populate the GPU when it's necessary.
     :param batch_size: size of a single batch processed by GPU
     :param prior_stats: The collected sufficient statistics of the prior. None
@@ -570,8 +571,13 @@ def fit_gmm_step(
     if top_m is not None and candidate_indices is not None and topm_cache is None:
         topm_cache = build_topm_cache(initial_model, precision=precision)
 
+    low_elbo_count = int(low_elbo_count or 0)
+    collect_low_elbo = low_elbo_count > 0
+    low_elbo_idcs = []
+    low_elbo_values = []
     n_batches = int(np.ceil(data.shape[0] / batch_size))
     for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
         xi = data[batch_idx * batch_size : (batch_idx + 1) * batch_size]
         xi = jnp.expand_dims(jnp.array(xi), -1)
         if dtype is not None:
@@ -583,8 +589,9 @@ def fit_gmm_step(
             )
 
         size = xi.shape[0]
+        elbo = None
         if top_m is not None and candidate_idx is not None:
-            ps, ss, cs, sems = compute_candidate_topm_stats_cached(
+            ps, ss, cs, sems, elbo = compute_candidate_topm_stats_cached(
                 topm_cache.space,
                 topm_cache.color,
                 topm_cache.semantic,
@@ -600,7 +607,9 @@ def fit_gmm_step(
                 int(topm_cache.n_sem),
             )
         elif top_m is not None:
-            ps, ss, cs, sems = compute_topm_stats(initial_model, xi[:size], int(top_m))
+            ps, ss, cs, sems, elbo = compute_topm_stats(
+                initial_model, xi[:size], int(top_m)
+            )
         else:
             if size < batch_size:
                 # Concat zeros, so that the posteriors are still computed with jit
@@ -611,13 +620,14 @@ def fit_gmm_step(
                     [xi, jnp.zeros((batch_size - size, *xi.shape[1:]))],
                     axis=0,
                 )
-                _, posteriors = compute_elbo_delta_with_precision(
+                elbo, posteriors = compute_elbo_delta_with_precision(
                     initial_model, xi, precision
                 )
                 xi = xi[:size]
+                elbo = elbo[:size]
                 posteriors = posteriors[:size]
             else:
-                _, posteriors = compute_elbo_delta_with_precision(
+                elbo, posteriors = compute_elbo_delta_with_precision(
                     initial_model, xi, precision
                 )
 
@@ -637,6 +647,14 @@ def fit_gmm_step(
                 sems, _ = get_likelihood_sst(
                     initial_model.semantic_delta, dsem, posteriors
                 )
+
+        if collect_low_elbo and elbo is not None:
+            batch_elbo = np.asarray(jax.block_until_ready(elbo))[:size]
+            keep = min(low_elbo_count, int(batch_elbo.shape[0]))
+            if keep > 0:
+                local_idcs = np.argpartition(batch_elbo, keep - 1)[:keep]
+                low_elbo_idcs.append(local_idcs + batch_start)
+                low_elbo_values.append(batch_elbo[local_idcs])
 
         if batch_idx == 0 and prior_stats is None:
             prior_stats = ps
@@ -664,4 +682,21 @@ def fit_gmm_step(
             semantic_stats, **initial_model.mixture.likelihood_opts
         )
 
-    return model, prior_stats, space_stats, color_stats, semantic_stats
+    if not collect_low_elbo:
+        return model, prior_stats, space_stats, color_stats, semantic_stats
+
+    if low_elbo_idcs:
+        all_idcs = np.concatenate(low_elbo_idcs)
+        all_values = np.concatenate(low_elbo_values)
+        keep = min(low_elbo_count, int(all_values.shape[0]))
+        selected = np.argpartition(all_values, keep - 1)[:keep]
+        low_elbo = {
+            "point_indices": all_idcs[selected],
+            "elbo": all_values[selected],
+        }
+    else:
+        low_elbo = {
+            "point_indices": np.asarray([], dtype=np.int64),
+            "elbo": np.asarray([], dtype=np.float32),
+        }
+    return model, prior_stats, space_stats, color_stats, semantic_stats, low_elbo

@@ -79,14 +79,11 @@ if __name__ == "__main__":
         with open(out_path / "transforms_train.json", "w") as fp:
             json.dump({"frames": frames}, fp, indent=2)
 
-        # we changed the script to fit the test data for blender so now we have to use this naming
         with open(out_path / "transforms_test.json", "w") as fp:
             json.dump({"frames": frames}, fp, indent=2)
 
-        # we changed the script to fit the test data for blender so now we have to use this naming
         with open(out_path / "transforms_eval.json", "w") as fp:
             json.dump({"frames": frames_val}, fp, indent=2)
 
-        # we changed the script to fit the test data for blender so now we have to use this naming
         with open(out_path / "transforms_eval_200.json", "w") as fp:
             json.dump({"frames": frames_val[:200]}, fp, indent=2)
