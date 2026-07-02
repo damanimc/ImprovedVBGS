@@ -78,6 +78,12 @@ def parse_args():
         action="store_true",
         help="Record per-frame timings and write metrics.json",
     )
+    parser.add_argument(
+        "--preload",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load all training frames into RAM before the training loop",
+    )
     return parser.parse_args()
 
 
@@ -116,7 +122,7 @@ def resolve_split(data_path, split):
     raise ValueError("Need at least 1 loadable frame")
 
 
-def make_data_iter(data_path, split, data_params, subsample):
+def make_data_iter(data_path, split, data_params, subsample, preload=False):
     data_iter = SceneDataIterator(
         data_path,
         split=split,
@@ -125,6 +131,14 @@ def make_data_iter(data_path, split, data_params, subsample):
     )
     if len(data_iter) < 1:
         raise ValueError("Need at least 1 loadable frame")
+    return data_iter
+
+
+def prepare_data_iter(data_iter, frames, preload):
+    if frames is not None:
+        data_iter._frames = data_iter._frames[:frames]
+    if preload:
+        data_iter.preload_frames()
     return data_iter
 
 
@@ -178,11 +192,13 @@ def main():
     manifest = load_scene_manifest(args.data_path)
     data_params = scene_data_params(manifest)
     train_split = resolve_split(args.data_path, args.split)
-    data_iter = make_data_iter(
-        args.data_path, train_split, data_params, args.subsample
+    data_iter = prepare_data_iter(
+        make_data_iter(
+            args.data_path, train_split, data_params, args.subsample
+        ),
+        args.frames,
+        args.preload,
     )
-    if args.frames is not None:
-        data_iter._frames = data_iter._frames[: args.frames]
 
     init_random = args.init == "random"
     init_first_frame = args.init == "first-frame"
@@ -198,11 +214,13 @@ def main():
         rng = np.random.default_rng(args.seed)
         idcs = rng.permutation(data.shape[0])[: args.components]
         x_data = data[idcs]
-        data_iter = make_data_iter(
-            args.data_path, train_split, data_params, args.subsample
+        data_iter = prepare_data_iter(
+            make_data_iter(
+                args.data_path, train_split, data_params, args.subsample
+            ),
+            args.frames,
+            args.preload,
         )
-        if args.frames is not None:
-            data_iter._frames = data_iter._frames[: args.frames]
 
     feature_dim = 6 + max(0, int(args.semantic_classes))
     if x_data is not None and x_data.shape[1] != feature_dim:
@@ -268,6 +286,7 @@ def main():
             "reassign": args.reassign,
             "reassign_every": args.reassign_every,
             "reassign_fraction": args.reassign_fraction,
+            "preload": args.preload,
             "split": train_split,
             "train_frames": len(data_iter),
             "eval_enabled": args.eval,
@@ -282,7 +301,7 @@ def main():
     prefetch_executor = ThreadPoolExecutor(max_workers=1)
     prefetch = None
 
-    for step in tqdm(range(n_frames), total=n_frames):
+    for step in tqdm(range(n_frames), total=n_frames, desc="training", unit="frame"):
         if prefetch is not None:
             x, candidate_indices = prefetch.result()
         else:

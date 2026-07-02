@@ -19,12 +19,32 @@ import numpy as np
 from PIL import Image
 
 
-TUM_FREIBURG1_INTRINSICS = {
-    "fx": 517.3,
-    "fy": 516.5,
-    "cx": 318.6,
-    "cy": 255.3,
-    "depth_scale": 5000.0,
+TUM_DEPTH_SCALE = 5000.0
+
+# Official TUM Kinect color-camera intrinsics per sensor generation.
+# Raw TUM downloads do not ship a calibration file; see load_tum_intrinsics().
+TUM_OFFICIAL_INTRINSICS = {
+    "freiburg1": {
+        "fx": 517.3,
+        "fy": 516.5,
+        "cx": 318.6,
+        "cy": 255.3,
+        "depth_scale": TUM_DEPTH_SCALE,
+    },
+    "freiburg2": {
+        "fx": 520.9,
+        "fy": 521.0,
+        "cx": 325.1,
+        "cy": 249.7,
+        "depth_scale": TUM_DEPTH_SCALE,
+    },
+    "freiburg3": {
+        "fx": 535.4,
+        "fy": 539.2,
+        "cx": 320.1,
+        "cy": 247.6,
+        "depth_scale": TUM_DEPTH_SCALE,
+    },
 }
 
 DEFAULT_CAMERA_ANGLE_X = 0.6911112070083618
@@ -116,6 +136,96 @@ def _camera_angle_x_from_intrinsics(width: int, fx: float) -> float:
     return float(2 * np.arctan2(width / 2.0, float(fx)))
 
 
+def _normalize_intrinsics(raw: dict) -> dict:
+    required = ("fx", "fy", "cx", "cy")
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise ValueError(f"Intrinsics missing keys: {', '.join(missing)}")
+    return {
+        "fx": float(raw["fx"]),
+        "fy": float(raw["fy"]),
+        "cx": float(raw["cx"]),
+        "cy": float(raw["cy"]),
+        "depth_scale": float(raw.get("depth_scale", TUM_DEPTH_SCALE)),
+    }
+
+
+def _parse_calibration_txt(path: Path) -> dict:
+    """Parse ETH3D/TUM-style calibration.txt: ``fx fy cx cy [depth_scale]``."""
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            raise ValueError(f"{path} must contain at least fx fy cx cy")
+        fx, fy, cx, cy = map(float, parts[:4])
+        depth_scale = float(parts[4]) if len(parts) > 4 else TUM_DEPTH_SCALE
+        return _normalize_intrinsics(
+            {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "depth_scale": depth_scale}
+        )
+    raise ValueError(f"{path} is empty")
+
+
+def _load_intrinsics_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    with path.open() as f:
+        payload = json.load(f)
+    if "intrinsics" in payload:
+        payload = payload["intrinsics"]
+    elif path.name != "intrinsics.json":
+        return None
+    return _normalize_intrinsics(payload)
+
+
+def _load_intrinsics_from_transforms(tum_path: Path) -> dict | None:
+    for name in ("transforms_train.json", "transforms_val.json", "transforms_test.json"):
+        loaded = _load_intrinsics_json(tum_path / name)
+        if loaded is not None:
+            return loaded
+    return None
+
+
+def _tum_sensor_id(folder_name: str) -> str:
+    name = folder_name.lower()
+    if "freiburg3" in name:
+        return "freiburg3"
+    if "freiburg2" in name:
+        return "freiburg2"
+    return "freiburg1"
+
+
+def load_tum_intrinsics(tum_path: Path) -> dict:
+    """Load TUM camera intrinsics for a raw or preprocessed scene folder.
+
+    Resolution order:
+    1. ``calibration.txt`` in the folder (``fx fy cx cy [depth_scale]``)
+    2. ``intrinsics.json`` in the folder
+    3. ``intrinsics`` saved in an existing ``transforms_*.json`` or ``manifest.json``
+    4. Official TUM sensor defaults inferred from ``freiburg1/2/3`` in the folder name
+
+    Standard TUM RGB-D archives only contain rgb/depth/groundtruth lists, not
+    calibration files, so (4) is the usual fallback for fresh downloads.
+    """
+    tum_path = Path(tum_path)
+    calibration_txt = tum_path / "calibration.txt"
+    if calibration_txt.exists():
+        return _parse_calibration_txt(calibration_txt)
+
+    for json_name in ("intrinsics.json", "manifest.json"):
+        loaded = _load_intrinsics_json(tum_path / json_name)
+        if loaded is not None:
+            return loaded
+
+    loaded = _load_intrinsics_from_transforms(tum_path)
+    if loaded is not None:
+        return loaded
+
+    sensor = _tum_sensor_id(tum_path.name)
+    return dict(TUM_OFFICIAL_INTRINSICS[sensor])
+
+
 def _opencv_c2w_to_opengl_c2w(pose: np.ndarray) -> np.ndarray:
     """Convert TUM/OpenCV camera axes to Blender/NeRF transform axes."""
     converted = np.array(pose, dtype=np.float64, copy=True)
@@ -150,6 +260,7 @@ def _write_scene_manifest(
     val_frames: int,
     normalization_ranges: list[list[float]],
     warning: str | None = None,
+    intrinsics: dict | None = None,
 ) -> None:
     manifest = {
         "type": "vbgs_scene",
@@ -159,6 +270,8 @@ def _write_scene_manifest(
         "val_frames": int(val_frames),
         "normalization_ranges": normalization_ranges,
     }
+    if intrinsics is not None:
+        manifest["intrinsics"] = intrinsics
     if warning:
         manifest["warning"] = warning
     with (output / "manifest.json").open("w") as f:
@@ -181,6 +294,7 @@ def preprocess_tum(args: argparse.Namespace) -> None:
     val_dir.mkdir(exist_ok=True)
 
     associations = associate_tum(tum_path)
+    intrinsics = load_tum_intrinsics(tum_path)
     selected = associations[:: args.stride]
     if args.frames is not None:
         selected = selected[: args.frames]
@@ -195,7 +309,7 @@ def preprocess_tum(args: argparse.Namespace) -> None:
         Image.open(assoc.rgb_path).convert("RGB").save(rgb_path)
 
         depth_raw = np.asarray(Image.open(assoc.depth_path), dtype=np.float32)
-        depth_m = depth_raw / float(TUM_FREIBURG1_INTRINSICS["depth_scale"])
+        depth_m = depth_raw / float(intrinsics["depth_scale"])
         np.save(split_dir / f"{stem}_depth_da3.npy", depth_m.astype(np.float32))
 
         record = {
@@ -217,9 +331,9 @@ def preprocess_tum(args: argparse.Namespace) -> None:
     first_rgb = Image.open(selected[0].rgb_path)
     camera_angle_x = _camera_angle_x_from_intrinsics(
         first_rgb.size[0],
-        TUM_FREIBURG1_INTRINSICS["fx"],
+        intrinsics["fx"],
     )
-    metadata = {"intrinsics": TUM_FREIBURG1_INTRINSICS}
+    metadata = {"intrinsics": intrinsics}
     _write_scene_transforms(output, "train", train_frames, camera_angle_x, metadata=metadata)
     _write_scene_transforms(output, "val", val_frames, camera_angle_x, metadata=metadata)
     _write_scene_transforms(output, "test", val_frames or train_frames, camera_angle_x, metadata=metadata)
@@ -230,6 +344,7 @@ def preprocess_tum(args: argparse.Namespace) -> None:
         train_frames=len(train_frames),
         val_frames=len(val_frames),
         normalization_ranges=[[-5, 5], [-5, 5], [-5, 5], [0, 1], [0, 1], [0, 1]],
+        intrinsics=intrinsics,
     )
 
 

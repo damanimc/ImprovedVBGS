@@ -10,7 +10,7 @@ training, 21.42 dB validation PSNR.
 
 ![TUM RGB-D prediction](Tum.png)
 
-Current TUM `freiburg1_desk` 100k-component unified run, highest-PSNR
+Current TUM `freiburg1_xyz` 100k-component unified run, highest-PSNR
 validation prediction.
 
 ## Install
@@ -114,13 +114,13 @@ python eval.py \
 
 ## TUM RGB-D
 
-Download the TUM `freiburg1_desk` sequence:
+Download the TUM `freiburg1_xyz` sequence:
 
 ```bash
 mkdir -p data/tum
-wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_desk.tgz \
-  -O data/tum/rgbd_dataset_freiburg1_desk.tgz
-tar -xzf data/tum/rgbd_dataset_freiburg1_desk.tgz -C data/tum
+wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_xyz.tgz \
+  -O data/tum/rgbd_dataset_freiburg1_xyz.tgz
+tar -xzf data/tum/rgbd_dataset_freiburg1_xyz.tgz -C data/tum
 ```
 
 Preprocess into the same folder (adds `train/`, `val/`, and `transforms_*.json`
@@ -128,9 +128,9 @@ alongside the raw TUM files):
 
 ```bash
 python src/preprocess/preprocess.py tum-rgbd \
-  --input data/tum/rgbd_dataset_freiburg1_desk \
-  --output data/tum/rgbd_dataset_freiburg1_desk \
-  --frames 300 \
+  --input data/tum/rgbd_dataset_freiburg1_xyz \
+  --output data/tum/rgbd_dataset_freiburg1_xyz \
+  --frames 798 \
   --stride 1 \
   --val-stride 3
 ```
@@ -141,10 +141,10 @@ Lego:
 ```bash
 cd src/vbgs/scripts
 python train.py \
-  --data-path ../../../data/tum/rgbd_dataset_freiburg1_desk \
- --run-name freiburg1_desk \
+  --data-path ../../../data/tum/rgbd_dataset_freiburg1_xyz \
+ --run-name freiburg1_xyz \
   --components 100000 \
-  --frames 200 \
+  --frames 530 \
   --batch-size 250000 \
   --top-m 1 \
   --candidate-m 4 \
