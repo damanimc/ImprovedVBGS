@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -15,11 +17,22 @@ def build_sparse_index(index_model, top_m=None, candidate_m=None, precision="fp6
     """Build spatial and top-M caches used by sparse E-steps."""
     if top_m is None or candidate_m is None:
         return None, None
-    means = np.asarray(index_model.mixture.likelihood.mean[:, :3, 0])
-    return cKDTree(means), build_topm_cache(index_model, precision=precision)
+    means = np.ascontiguousarray(
+        np.asarray(index_model.mixture.likelihood.mean[:, :3, 0], dtype=np.float64)
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tree_future = pool.submit(cKDTree, means)
+        cache_future = pool.submit(build_topm_cache, index_model, precision=precision)
+        return tree_future.result(), cache_future.result()
 
 
-def query_candidate_indices(candidate_tree, points_xyz, candidate_m, n_components):
+def query_candidate_indices(
+    candidate_tree,
+    points_xyz,
+    candidate_m,
+    n_components,
+    eps=0.0,
+):
     """Query candidate Gaussian indices for each point."""
     if candidate_tree is None or candidate_m is None:
         return None
@@ -27,6 +40,7 @@ def query_candidate_indices(candidate_tree, points_xyz, candidate_m, n_component
     candidate_indices = candidate_tree.query(
         np.asarray(points_xyz),
         k=k,
+        eps=float(eps),
         workers=-1,
     )[1]
     if candidate_indices.ndim == 1:

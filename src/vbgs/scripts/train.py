@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -44,6 +45,11 @@ def parse_args():
     parser.add_argument("--components", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=100_000)
     parser.add_argument("--frames", type=int, default=None)
+    parser.add_argument(
+        "--split",
+        choices=["auto", "train", "test", "val"],
+        default="auto",
+    )
     parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval-batch-size", type=int, default=50_000)
     parser.add_argument("--eval-subsample", type=int, default=None)
@@ -52,6 +58,7 @@ def parse_args():
     parser.add_argument("--precision", choices=["fp64", "fp32", "tf32"], default="fp64")
     parser.add_argument("--top-m", type=int, default=32)
     parser.add_argument("--candidate-m", type=int, default=128)
+    parser.add_argument("--candidate-eps", type=float, default=0.0)
     parser.add_argument("--init", choices=["random", "first-frame", "full-data"], default="random")
     parser.add_argument("--init-downsample-factor", type=int, default=None)
     parser.add_argument("--densify", action=argparse.BooleanOptionalAction, default=False)
@@ -66,6 +73,11 @@ def parse_args():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=None)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Record per-frame timings and write metrics.json",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +103,44 @@ def has_split(data_path, split):
     with path.open() as f:
         data = json.load(f)
     return len(data.get("frames", [])) > 0
+
+
+def resolve_split(data_path, split):
+    if split != "auto":
+        return split
+    for candidate in ("train", "test", "val"):
+        if has_split(data_path, candidate) and len(
+            SceneDataIterator(data_path, split=candidate)
+        ):
+            return candidate
+    raise ValueError("Need at least 1 loadable frame")
+
+
+def make_data_iter(data_path, split, data_params, subsample):
+    data_iter = SceneDataIterator(
+        data_path,
+        split=split,
+        data_params=data_params,
+        subsample=subsample,
+    )
+    if len(data_iter) < 1:
+        raise ValueError("Need at least 1 loadable frame")
+    return data_iter
+
+
+def load_frame_and_candidates(
+    data_iter, step, candidate_tree, candidate_m, n_components, candidate_eps
+):
+    x = data_iter._get_frame(step)
+    if candidate_tree is None:
+        return x, None
+    return x, query_candidate_indices(
+        candidate_tree,
+        x[:, :3],
+        candidate_m,
+        n_components,
+        eps=candidate_eps,
+    )
 
 
 def frame_record(step, x, *, densify_stats, **timings):
@@ -127,16 +177,12 @@ def main():
     key = jr.PRNGKey(args.seed)
     manifest = load_scene_manifest(args.data_path)
     data_params = scene_data_params(manifest)
-    data_iter = SceneDataIterator(
-        args.data_path,
-        split="train",
-        data_params=data_params,
-        subsample=args.subsample,
+    train_split = resolve_split(args.data_path, args.split)
+    data_iter = make_data_iter(
+        args.data_path, train_split, data_params, args.subsample
     )
     if args.frames is not None:
         data_iter._frames = data_iter._frames[: args.frames]
-    if len(data_iter) < 1:
-        raise ValueError("Need at least 1 train frame")
 
     init_random = args.init == "random"
     init_first_frame = args.init == "first-frame"
@@ -152,11 +198,8 @@ def main():
         rng = np.random.default_rng(args.seed)
         idcs = rng.permutation(data.shape[0])[: args.components]
         x_data = data[idcs]
-        data_iter = SceneDataIterator(
-            args.data_path,
-            split="train",
-            data_params=data_params,
-            subsample=args.subsample,
+        data_iter = make_data_iter(
+            args.data_path, train_split, data_params, args.subsample
         )
         if args.frames is not None:
             data_iter._frames = data_iter._frames[: args.frames]
@@ -203,40 +246,64 @@ def main():
         precision=args.precision,
     )
     prior_stats, space_stats, color_stats = None, None, None
-    metrics = {
-        "data": str(args.data_path),
-        "source_type": manifest.get("source_type"),
-        "components": args.components,
-        "batch_size": args.batch_size,
-        "precision": args.precision,
-        "top_m": args.top_m,
-        "candidate_m": args.candidate_m,
-        "semantic_classes": int(args.semantic_classes),
-        "init": args.init,
-        **init_metrics,
-        "densify": args.densify,
-        "densify_point_ratio": args.densify_point_ratio,
-        "densify_unseen_distance_threshold": args.densify_unseen_distance_threshold,
-        "densify_min_unseen_fraction": args.densify_min_unseen_fraction,
-        "densify_min_unseen_points": args.densify_min_unseen_points,
-        "densify_reassign_if_full": args.densify_reassign_if_full,
-        "reassign": args.reassign,
-        "reassign_every": args.reassign_every,
-        "reassign_fraction": args.reassign_fraction,
-        "train_frames": len(data_iter),
-        "eval_enabled": args.eval,
-        "frames": [],
-        "eval": [],
-    }
+    metrics = (
+        {
+            "data": str(args.data_path),
+            "source_type": manifest.get("source_type"),
+            "components": args.components,
+            "batch_size": args.batch_size,
+            "precision": args.precision,
+            "top_m": args.top_m,
+            "candidate_m": args.candidate_m,
+            "candidate_eps": args.candidate_eps,
+            "semantic_classes": int(args.semantic_classes),
+            "init": args.init,
+            **init_metrics,
+            "densify": args.densify,
+            "densify_point_ratio": args.densify_point_ratio,
+            "densify_unseen_distance_threshold": args.densify_unseen_distance_threshold,
+            "densify_min_unseen_fraction": args.densify_min_unseen_fraction,
+            "densify_min_unseen_points": args.densify_min_unseen_points,
+            "densify_reassign_if_full": args.densify_reassign_if_full,
+            "reassign": args.reassign,
+            "reassign_every": args.reassign_every,
+            "reassign_fraction": args.reassign_fraction,
+            "split": train_split,
+            "train_frames": len(data_iter),
+            "eval_enabled": args.eval,
+            "frames": [],
+            "eval": [],
+        }
+        if args.debug
+        else {}
+    )
 
-    for step, x in tqdm(enumerate(data_iter), total=len(data_iter)):
-        start = time.perf_counter()
-        densify_seconds = 0.0
-        reassign_seconds = 0.0
-        sparse_rebuild_seconds = 0.0
+    n_frames = len(data_iter)
+    prefetch_executor = ThreadPoolExecutor(max_workers=1)
+    prefetch = None
+
+    for step in tqdm(range(n_frames), total=n_frames):
+        if prefetch is not None:
+            x, candidate_indices = prefetch.result()
+        else:
+            x, candidate_indices = load_frame_and_candidates(
+                data_iter,
+                step,
+                candidate_tree,
+                args.candidate_m,
+                args.components,
+                args.candidate_eps,
+            )
+        if args.debug:
+            start = time.perf_counter()
+            densify_seconds = 0.0
+            reassign_seconds = 0.0
+            sparse_rebuild_seconds = 0.0
+            kdtree_seconds = 0.0
         densify_stats = default_densify_stats(args.densify_unseen_distance_threshold)
         if args.densify and not (init_first_frame and step == 0):
-            densify_start = time.perf_counter()
+            if args.debug:
+                densify_start = time.perf_counter()
             available = strict_unused_count(model, prior_model)
             densify_stats["available_components"] = available
             densify_stats["strict_unused_components"] = available
@@ -266,29 +333,22 @@ def main():
                 prior_stats = reset_component_stats(prior_stats, inserted_components)
                 space_stats = reset_component_stats(space_stats, inserted_components)
                 color_stats = reset_component_stats(color_stats, inserted_components)
-            densify_seconds = time.perf_counter() - densify_start
+            if args.debug:
+                densify_seconds = time.perf_counter() - densify_start
             if densify_stats["densified_components"] > 0:
-                rebuild_start = time.perf_counter()
+                if args.debug:
+                    rebuild_start = time.perf_counter()
                 candidate_tree, topm_cache = build_sparse_index(
                     prior_model,
                     top_m=args.top_m,
                     candidate_m=args.candidate_m,
                     precision=args.precision,
                 )
-                sparse_rebuild_seconds += time.perf_counter() - rebuild_start
+                if args.debug:
+                    sparse_rebuild_seconds += time.perf_counter() - rebuild_start
 
-        candidate_indices = None
-        kdtree_seconds = 0.0
-        if candidate_tree is not None:
-            tk = time.perf_counter()
-            candidate_indices = query_candidate_indices(
-                candidate_tree,
-                x[:, :3],
-                args.candidate_m,
-                args.components,
-            )
-            kdtree_seconds = time.perf_counter() - tk
-        fit_start = time.perf_counter()
+        if args.debug:
+            fit_start = time.perf_counter()
         low_elbo_count = (
             max(1024, int(args.components * args.reassign_fraction * 4))
             if (
@@ -324,7 +384,8 @@ def main():
         else:
             model, prior_stats, space_stats, color_stats, _semantic_stats = fit_result
         if low_elbo_count:
-            reassign_start = time.perf_counter()
+            if args.debug:
+                reassign_start = time.perf_counter()
             prior_model = reassign(
                 prior_model,
                 model,
@@ -335,31 +396,48 @@ def main():
                 point_indices=low_elbo["point_indices"],
                 point_elbos=low_elbo["elbo"],
             )
-            reassign_seconds = time.perf_counter() - reassign_start
-            rebuild_start = time.perf_counter()
+            if args.debug:
+                reassign_seconds = time.perf_counter() - reassign_start
+                rebuild_start = time.perf_counter()
             candidate_tree, topm_cache = build_sparse_index(
                 prior_model,
                 top_m=args.top_m,
                 candidate_m=args.candidate_m,
                 precision=args.precision,
             )
-            sparse_rebuild_seconds += time.perf_counter() - rebuild_start
+            if args.debug:
+                sparse_rebuild_seconds += time.perf_counter() - rebuild_start
         jax.block_until_ready(model.mixture.likelihood.mean)
-        metrics["frames"].append(
-            frame_record(
-                step,
-                x,
-                seconds=time.perf_counter() - start,
-                fit_seconds=time.perf_counter() - fit_start,
-                densify_seconds=densify_seconds,
-                reassign_seconds=reassign_seconds,
-                kdtree_seconds=kdtree_seconds,
-                sparse_rebuild_seconds=sparse_rebuild_seconds,
-                densify_stats=densify_stats,
+        if step + 1 < n_frames:
+            prefetch = prefetch_executor.submit(
+                load_frame_and_candidates,
+                data_iter,
+                step + 1,
+                candidate_tree,
+                args.candidate_m,
+                args.components,
+                args.candidate_eps,
             )
-        )
+        else:
+            prefetch = None
+        if args.debug:
+            metrics["frames"].append(
+                frame_record(
+                    step,
+                    x,
+                    seconds=time.perf_counter() - start,
+                    fit_seconds=time.perf_counter() - fit_start,
+                    densify_seconds=densify_seconds,
+                    reassign_seconds=reassign_seconds,
+                    kdtree_seconds=kdtree_seconds,
+                    sparse_rebuild_seconds=sparse_rebuild_seconds,
+                    densify_stats=densify_stats,
+                )
+            )
         if args.save_every is not None and (step + 1) % args.save_every == 0:
             output.checkpoint(model, data_params, f"model_{step:03d}.json")
+
+    prefetch_executor.shutdown(wait=False)
 
     if args.eval and has_split(args.data_path, "val"):
         eval_iter = SceneDataIterator(
@@ -369,7 +447,7 @@ def main():
             subsample=None,
         )
         eval_frames = [x for x in eval_iter]
-        metrics["eval"] = eval_elbo(
+        eval_results = eval_elbo(
             model,
             eval_frames,
             args.eval_batch_size,
@@ -379,10 +457,13 @@ def main():
             top_m=args.top_m,
             candidate_m=args.candidate_m,
         )
+        if args.debug:
+            metrics["eval"] = eval_results
 
-    output.final_model(model, data_params, metrics)
-    output.metrics(metrics)
-    print(json.dumps(metrics, indent=2))
+    paths = output.final_model(model, data_params, metrics)
+    if args.debug:
+        output.metrics(metrics)
+    print(f"done: {paths['final_model']}")
 
 
 if __name__ == "__main__":

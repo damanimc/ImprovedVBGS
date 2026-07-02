@@ -371,7 +371,11 @@ class Conjugate(Distribution):
         self.update_from_statistics(summed_stats, lr, beta)
 
     def update_from_statistics(
-        self, summed_stats: ArrayDict, lr: float = 1.0, beta: float = 0.0
+        self,
+        summed_stats: ArrayDict,
+        lr: float = 1.0,
+        beta: float = 0.0,
+        refresh_cache: bool = True,
     ):
         """
         Updates the natural parameters of posterior given likelihood statistics.

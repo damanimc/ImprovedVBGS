@@ -1,7 +1,7 @@
 # Improved Variational Bayes Gaussian Splatting
 
 ImprovedVBGS is a faster implementation of VBGS training. Using sparse top-M CAVI
-responsibilities, a densification strategy and improved reassignment. On an NVIDIA 3070Ti a 200 frame training is completed in ~2.7 minutes which is a significant improvement (87x) over the baseline ~234 minutes on an NVIDIA A500 which would OOM on 8GB of VRAM. It is also a significant improvement on the follow up paper which reports ~61 minutes on the same hardware (code unavailable).
+responsibilities, a densification strategy and improved reassignment. On an NVIDIA 3070Ti a 200 frame training is completed in ~1 minutes which is a significant improvement (280x) over the baseline ~234 minutes on an NVIDIA A500 which would OOM on 8GB of VRAM. It is also a significant improvement on the follow up paper which reports ~61 minutes on the same hardware (code unavailable).
 
 ![Lego reconstruction](Lego.png)
 
@@ -65,37 +65,37 @@ done
 Train Lego with the unified scene trainer:
 
 ```bash
+
 cd src/vbgs/scripts
-PYTHONPATH=.. python train.py \
-  --data-path ../../../data/scenes/lego \
+python train.py \
+  --data-path ../../../data/blender/lego \
   --run-name lego \
   --components 100000 \
   --frames 200 \
-  --batch-size 100000 \
-  --top-m 32 \
-  --candidate-m 128 \
+  --batch-size 250000 \
+  --top-m 1 \
+  --candidate-m 4 \
   --init random \
   --no-densify \
   --reassign \
   --reassign-every 1 \
   --reassign-fraction 0.05 \
   --precision fp64 \
-  --eval \
-  --eval-batch-size 100000
+  --no-eval
 ```
 
 Train all preprocessed Blender scenes:
 
 ```bash
 for scene in chair drums ficus hotdog lego materials mic ship; do
-  PYTHONPATH=.. python train.py \
+  python train.py \
     --data-path "../../../data/scenes/${scene}" \
     --run-name "${scene}" \
     --components 100000 \
     --frames 200 \
-    --batch-size 100000 \
-    --top-m 32 \
-    --candidate-m 128 \
+    --batch-size 250000 \
+    --top-m 1 \
+    --candidate-m 4 \
     --init random \
     --no-densify \
     --precision fp64 \
@@ -106,7 +106,7 @@ done
 Evaluate and save renders:
 
 ```bash
-PYTHONPATH=.. python eval.py \
+python eval.py \
   ../output/lego/model_final.json \
   --data-path ../../data/blender/lego \
   --save-images
@@ -114,12 +114,22 @@ PYTHONPATH=.. python eval.py \
 
 ## TUM RGB-D
 
-Create the render/eval scene from the original TUM RGB-D folder:
+Download the TUM `freiburg1_desk` sequence:
+
+```bash
+mkdir -p data/tum
+wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_desk.tgz \
+  -O data/tum/rgbd_dataset_freiburg1_desk.tgz
+tar -xzf data/tum/rgbd_dataset_freiburg1_desk.tgz -C data/tum
+```
+
+Preprocess into the same folder (adds `train/`, `val/`, and `transforms_*.json`
+alongside the raw TUM files):
 
 ```bash
 python src/preprocess/preprocess.py tum-rgbd \
   --input data/tum/rgbd_dataset_freiburg1_desk \
-  --output data/scenes/tum_freiburg1_desk_300 \
+  --output data/tum/rgbd_dataset_freiburg1_desk \
   --frames 300 \
   --stride 1 \
   --val-stride 3
@@ -130,31 +140,21 @@ Lego:
 
 ```bash
 cd src/vbgs/scripts
-PYTHONPATH=.. python train.py \
-  --data-path ../../../data/scenes/tum_freiburg1_desk_300 \
-  --run-name tum-lego-settings-nc100k-random-reassign-300f \
+python train.py \
+  --data-path ../../../data/tum/rgbd_dataset_freiburg1_desk \
+ --run-name freiburg1_desk \
   --components 100000 \
   --frames 200 \
-  --batch-size 100000 \
-  --top-m 32 \
-  --candidate-m 128 \
+  --batch-size 250000 \
+  --top-m 1 \
+  --candidate-m 4 \
   --init random \
   --no-densify \
   --reassign \
   --reassign-every 1 \
   --reassign-fraction 0.05 \
   --precision fp64 \
-  --eval \
-  --eval-batch-size 100000
-```
-
-Render validation predictions:
-
-```bash
-PYTHONPATH=.. python eval.py \
-  ../output/tum-lego-settings-nc100k-random-reassign-300f/model_final.json \
-  --data-path ../../../data/scenes/tum_freiburg1_desk_300 \
-  --save-images
+  --no-eval
 ```
 
 ## Standard Scene Format

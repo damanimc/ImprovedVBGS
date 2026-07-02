@@ -455,7 +455,7 @@ def _candidate_topm_indices_cached(mean, inv_sigma, x_space, candidate_idx, top_
 
 def _compute_candidate_topm_stats_cached(
     space, color, semantic, prior_log_mean, mean, inv_sigma,
-    xi, candidate_idx, top_m, space_dim, color_dim, semantic_dim, n_sem
+    xi, candidate_idx, valid_mask, top_m, space_dim, color_dim, semantic_dim, n_sem
 ):
     n_components = int(prior_log_mean.shape[0])
     ds, dc, dsem = split_features(xi, n_sem)
@@ -469,7 +469,7 @@ def _compute_candidate_topm_stats_cached(
         sem_logprob = _topm_loglik_from_stats(semantic, semantic_dim, dsem, idx)
         logprob = logprob + sem_logprob
 
-    posteriors = softmax(logprob, axis=-1)
+    posteriors = softmax(logprob, axis=-1) * valid_mask[:, None]
     ps = ArrayDict(
         eta=ArrayDict(eta_1=_scatter_counts(idx, posteriors, n_components)),
         nu=None,
@@ -486,6 +486,62 @@ compute_candidate_topm_stats_cached = jax.jit(
     _compute_candidate_topm_stats_cached,
     static_argnames=("top_m", "space_dim", "color_dim", "semantic_dim", "n_sem"),
 )
+
+
+def _compute_candidate_hard_top1_stats_cached(
+    space, color, semantic, prior_log_mean, mean, inv_sigma,
+    xi, candidate_idx, valid_mask, space_dim, color_dim, semantic_dim, n_sem
+):
+    n_components = int(prior_log_mean.shape[0])
+    ds, dc, dsem = split_features(xi, n_sem)
+    idx = _candidate_topm_indices_cached(mean, inv_sigma, ds, candidate_idx, 1)
+    posteriors = jnp.ones(idx.shape, dtype=xi.dtype) * valid_mask[:, None]
+    logprob = (
+        _topm_loglik_from_stats(space, space_dim, ds, idx)
+        + _topm_loglik_from_stats(color, color_dim, dc, idx)
+        + jnp.take(prior_log_mean, idx, axis=0)
+    )
+    if dsem is not None:
+        logprob = logprob + _topm_loglik_from_stats(semantic, semantic_dim, dsem, idx)
+    ps = ArrayDict(
+        eta=ArrayDict(eta_1=_scatter_counts(idx, posteriors, n_components)),
+        nu=None,
+    )
+    ss = _scatter_mvn_stats(idx, posteriors, ds, n_components)
+    cs = _scatter_mvn_stats(idx, posteriors, dc, n_components)
+    sems = None
+    if dsem is not None:
+        sems = _scatter_mvn_stats(idx, posteriors, dsem, n_components)
+    return ps, ss, cs, sems, logprob[:, 0]
+
+
+compute_candidate_hard_top1_stats_cached = jax.jit(
+    _compute_candidate_hard_top1_stats_cached,
+    static_argnames=("space_dim", "color_dim", "semantic_dim", "n_sem"),
+)
+
+
+_PAD_BUFFERS = {}
+
+
+def _host_padded_batch(xi_np, ci_np, batch_size):
+    size = xi_np.shape[0]
+    if not ci_np.shape[0] or size >= batch_size:
+        return xi_np, ci_np
+    key = (batch_size, xi_np.shape[1], ci_np.shape[1], xi_np.dtype.str, ci_np.dtype.str)
+    bufs = _PAD_BUFFERS.get(key)
+    if bufs is None:
+        bufs = (
+            np.zeros((batch_size, *xi_np.shape[1:]), dtype=xi_np.dtype),
+            np.zeros((batch_size, *ci_np.shape[1:]), dtype=ci_np.dtype),
+        )
+        _PAD_BUFFERS[key] = bufs
+    xi_buf, ci_buf = bufs
+    xi_buf[:size] = xi_np
+    xi_buf[size:] = 0
+    ci_buf[:size] = ci_np
+    ci_buf[size:] = 0
+    return xi_buf, ci_buf
 
 
 def _compute_candidate_topm_elbo_cached(
@@ -575,37 +631,64 @@ def fit_gmm_step(
     collect_low_elbo = low_elbo_count > 0
     low_elbo_idcs = []
     low_elbo_values = []
+    sparse_path = top_m is not None and candidate_indices is not None
     n_batches = int(np.ceil(data.shape[0] / batch_size))
     for batch_idx in range(n_batches):
         batch_start = batch_idx * batch_size
-        xi = data[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-        xi = jnp.expand_dims(jnp.array(xi), -1)
+        xi_np = data[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+        size = xi_np.shape[0]
+        ci_np = None
+        if candidate_indices is not None:
+            ci_np = candidate_indices[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+
+        if sparse_path and size < batch_size:
+            xi_np, ci_np = _host_padded_batch(xi_np, ci_np, batch_size)
+
+        xi = jnp.expand_dims(jnp.asarray(xi_np), -1)
         if dtype is not None:
             xi = xi.astype(dtype)
-        candidate_idx = None
-        if candidate_indices is not None:
-            candidate_idx = jnp.array(
-                candidate_indices[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-            )
+        candidate_idx = (
+            jnp.asarray(ci_np, dtype=jnp.int32) if ci_np is not None else None
+        )
 
-        size = xi.shape[0]
         elbo = None
-        if top_m is not None and candidate_idx is not None:
-            ps, ss, cs, sems, elbo = compute_candidate_topm_stats_cached(
-                topm_cache.space,
-                topm_cache.color,
-                topm_cache.semantic,
-                topm_cache.prior_log_mean,
-                topm_cache.mean,
-                topm_cache.inv_sigma,
-                xi[:size],
-                candidate_idx[:size],
-                int(top_m),
-                int(topm_cache.space_dim),
-                int(topm_cache.color_dim),
-                int(topm_cache.semantic_dim),
-                int(topm_cache.n_sem),
-            )
+        if sparse_path and candidate_idx is not None:
+            # Compare against a device scalar so changing `size` does not bake a
+            # new constant into the compiled graph.
+            valid_mask = jnp.arange(batch_size) < jnp.asarray(size, dtype=jnp.int32)
+            if int(top_m) == 1:
+                ps, ss, cs, sems, elbo = compute_candidate_hard_top1_stats_cached(
+                    topm_cache.space,
+                    topm_cache.color,
+                    topm_cache.semantic,
+                    topm_cache.prior_log_mean,
+                    topm_cache.mean,
+                    topm_cache.inv_sigma,
+                    xi,
+                    candidate_idx,
+                    valid_mask,
+                    int(topm_cache.space_dim),
+                    int(topm_cache.color_dim),
+                    int(topm_cache.semantic_dim),
+                    int(topm_cache.n_sem),
+                )
+            else:
+                ps, ss, cs, sems, elbo = compute_candidate_topm_stats_cached(
+                    topm_cache.space,
+                    topm_cache.color,
+                    topm_cache.semantic,
+                    topm_cache.prior_log_mean,
+                    topm_cache.mean,
+                    topm_cache.inv_sigma,
+                    xi,
+                    candidate_idx,
+                    valid_mask,
+                    int(top_m),
+                    int(topm_cache.space_dim),
+                    int(topm_cache.color_dim),
+                    int(topm_cache.semantic_dim),
+                    int(topm_cache.n_sem),
+                )
         elif top_m is not None:
             ps, ss, cs, sems, elbo = compute_topm_stats(
                 initial_model, xi[:size], int(top_m)
