@@ -1,7 +1,7 @@
 # Improved Variational Bayes Gaussian Splatting
 
 ImprovedVBGS is a faster implementation of VBGS training. Using sparse top-M CAVI
-responsibilities, a densification strategy and improved reassignment. On an NVIDIA 3070Ti a 200 frame training is completed in ~1 minutes which is a significant improvement (280x) over the baseline ~234 minutes on an NVIDIA A500 which would OOM on 8GB of VRAM. It is also a significant improvement on the follow up paper which reports ~61 minutes on the same hardware (code unavailable).
+responsibilities, a densification strategy and improved reassignment. On an NVIDIA 3070Ti (8GB) a 200 frame training is completed in ~1 minute, which is a significant improvement over the baseline ~234 minutes on an NVIDIA A500 which would OOM on 8GB of VRAM. It is also a significant improvement on the follow up paper which reports ~61 minutes on the same hardware (code unavailable).
 
 ![Lego reconstruction](Lego.png)
 
