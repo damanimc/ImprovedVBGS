@@ -13,13 +13,21 @@ from vbgs.model.train import build_topm_cache
 from vbgs.model.utils import random_mean_init
 
 
-def build_sparse_index(index_model, top_m=None, candidate_m=None, precision="fp64"):
+def build_sparse_index(
+    index_model,
+    top_m=None,
+    candidate_m=None,
+    precision="fp64",
+    use_topm_cache=True,
+):
     """Build spatial and top-M caches used by sparse E-steps."""
     if top_m is None or candidate_m is None:
         return None, None
     means = np.ascontiguousarray(
         np.asarray(index_model.mixture.likelihood.mean[:, :3, 0], dtype=np.float64)
     )
+    if not use_topm_cache:
+        return cKDTree(means), None
     with ThreadPoolExecutor(max_workers=2) as pool:
         tree_future = pool.submit(cKDTree, means)
         cache_future = pool.submit(build_topm_cache, index_model, precision=precision)

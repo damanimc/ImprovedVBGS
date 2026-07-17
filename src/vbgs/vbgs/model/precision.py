@@ -95,6 +95,7 @@ def compile_op_precision_maps(
     tolerance: float = DEFAULT_TOLERANCE,
     output_dir: str | Path | None = None,
     white_noise_key=None,
+    search_mode: str = "full",
 ) -> PrecisionBundle:
     return compile_precision_bundle(
         model=model,
@@ -106,6 +107,7 @@ def compile_op_precision_maps(
         output_dir=output_dir,
         white_noise_key=white_noise_key,
         search=True,
+        search_mode=search_mode,
     )
 
 

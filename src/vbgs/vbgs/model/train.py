@@ -14,6 +14,10 @@
 # limitations under the License.
 
 
+from functools import partial
+
+import os
+
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -25,29 +29,6 @@ import numpy as np
 from vbgs.vi import utils
 from vbgs.vi.utils import ArrayDict
 from vbgs.model.feature_layout import model_n_semantic, split_features
-
-
-def _elbo_logprob_parts(model, d):
-    n_sem = model_n_semantic(model)
-    ds, dc, dsem = split_features(d, n_sem)
-    space_logprob = model.mixture.likelihood.expected_log_likelihood(ds)
-    color_logprob = model.delta.expected_log_likelihood(dc)
-    logprob = space_logprob + color_logprob
-    if dsem is not None:
-        logprob = logprob + model.semantic_delta.expected_log_likelihood(dsem)
-    prior_logprob = model.mixture.prior.log_mean()
-    logprob = logprob + prior_logprob
-    return logprob
-
-
-def _elbo_kl_parts(model, mixdims):
-    prior_kl = model.mixture.prior.kl_divergence()
-    space_kl = model.mixture.likelihood.kl_divergence().sum(mixdims)
-    color_kl = model.delta.kl_divergence().sum(mixdims)
-    kl = space_kl + prior_kl + color_kl
-    if model.semantic_delta is not None:
-        kl = kl + model.semantic_delta.kl_divergence().sum(mixdims)
-    return kl
 
 
 def _cast_floating_tree(tree, dtype):
@@ -131,113 +112,55 @@ def fit_gmm(initial_model, model, data):
     return model
 
 
-def _compute_elbo_delta_impl(model, data):
-    """
-    Computes the ELBO for the provided data.
-    Note: if the data is too large to process, you want to batch around this
-          function (see `fit_gmm_step`)
-
-    :param model : Mixture model instance which represents the joint
-                   distribution of space, color and the latent z
-    :param data : the data points to consider
-    :returns elbo: array of elbo's for each data point
-    :returns posteriors: array of the posterior distribution q(z) for all data
-    """
+@partial(jax.jit, static_argnames=("posteriors",))
+def _elbo_delta_jit(model, data, posteriors=True):
+    """Jitted dense E-step; traced by ``precision_runtime`` for op-level maps."""
     d = model.mixture.expand_to_categorical_dims(data)
-    logprob = _elbo_logprob_parts(model, d)
+    n_sem = model_n_semantic(model)
+    ds, dc, dsem = split_features(d, n_sem)
+    logprob = (
+        model.mixture.likelihood.expected_log_likelihood(ds)
+        + model.delta.expected_log_likelihood(dc)
+        + model.mixture.prior.log_mean()
+    )
+    if dsem is not None:
+        logprob = logprob + model.semantic_delta.expected_log_likelihood(dsem)
     mixdims = tuple(range(-model.mixture.prior.event_dim, 0))
-    elbo_contrib = logsumexp(logprob, mixdims)
-    elbo = elbo_contrib - _elbo_kl_parts(model, mixdims)
-    posteriors = softmax(logprob, mixdims)
-    return elbo, posteriors
+    kl = (
+        model.mixture.likelihood.kl_divergence().sum(mixdims)
+        + model.mixture.prior.kl_divergence()
+        + model.delta.kl_divergence().sum(mixdims)
+    )
+    if model.semantic_delta is not None:
+        kl = kl + model.semantic_delta.kl_divergence().sum(mixdims)
+    elbo = logsumexp(logprob, mixdims) - kl
+    if posteriors:
+        return elbo, softmax(logprob, mixdims)
+    return elbo
 
 
-def _compute_elbo_only_delta_impl(model, data):
-    d = model.mixture.expand_to_categorical_dims(data)
-    logprob = _elbo_logprob_parts(model, d)
-    mixdims = tuple(range(-model.mixture.prior.event_dim, 0))
-    elbo_contrib = logsumexp(logprob, mixdims)
-    return elbo_contrib - _elbo_kl_parts(model, mixdims)
-
-
-@jax.jit
-def compute_elbo_delta(model, data):
+def compute_elbo_delta(model, data, precision="fp64", posteriors=True):
     """
-    Computes the ELBO for the provided data.
-    Note: if the data is too large to process, you want to batch around this
-          function (see `fit_gmm_step`)
+    Dense E-step ELBO over all mixture components.
 
-    :param model : Mixture model instance which represents the joint
-                   distribution of space, color and the latent z
-    :param data : the data points to consider
-    :returns elbo: array of elbo's for each data point
-    :returns posteriors: array of the posterior distribution q(z) for all data
+    Batch in ``fit_gmm_step`` when data is large. Set ``posteriors=False`` for
+    reassign / eval rescans that only need per-point ELBO. Use ``precision='op'``
+    after mixed-precision search (see ``ensure_op_precision_runtime``).
+
+    :returns: ``(elbo, posteriors)`` when ``posteriors=True``, else ``elbo``
     """
-    return _compute_elbo_delta_impl(model, data)
-
-
-@jax.jit
-def compute_elbo_delta_fp32(model, data):
-    model = _cast_floating_tree(model, jnp.float32)
-    data = data.astype(jnp.float32)
-    return _compute_elbo_delta_impl(model, data)
-
-
-@jax.jit
-def compute_elbo_delta_tf32(model, data):
-    model = _cast_floating_tree(model, jnp.float32)
-    data = data.astype(jnp.float32)
-    with jax.default_matmul_precision("tensorfloat32"):
-        return _compute_elbo_delta_impl(model, data)
-
-
-def compute_elbo_delta_with_precision(model, data, precision="fp64"):
     if precision in ("op", "optimized"):
-        from vbgs.model.precision_runtime import run_elbo_delta
+        from vbgs.model.precision_runtime import run_op_elbo_delta
 
-        return run_elbo_delta(model, data)
-    if precision == "tf32":
-        return compute_elbo_delta_tf32(model, data)
-    if precision == "fp32":
-        return compute_elbo_delta_fp32(model, data)
-    if precision in ("fp64", "baseline"):
-        return compute_elbo_delta(model, data)
-    raise ValueError(f"Unsupported VBGS precision mode: {precision}")
-
-
-@jax.jit
-def compute_elbo_only_delta(model, data):
-    return _compute_elbo_only_delta_impl(model, data)
-
-
-@jax.jit
-def compute_elbo_only_delta_fp32(model, data):
-    model = _cast_floating_tree(model, jnp.float32)
-    data = data.astype(jnp.float32)
-    return _compute_elbo_only_delta_impl(model, data)
-
-
-@jax.jit
-def compute_elbo_only_delta_tf32(model, data):
-    model = _cast_floating_tree(model, jnp.float32)
-    data = data.astype(jnp.float32)
-    with jax.default_matmul_precision("tensorfloat32"):
-        return _compute_elbo_only_delta_impl(model, data)
-
-
-def compute_elbo_only_delta_with_precision(model, data, precision="fp64"):
-    if precision in ("op", "optimized"):
-        from vbgs.model.precision_runtime import run_elbo_only_delta
-
-        return run_elbo_only_delta(model, data)
-    if precision == "tf32":
-        return compute_elbo_only_delta_tf32(model, data)
-    if precision == "fp32":
-        return compute_elbo_only_delta_fp32(model, data)
-    if precision in ("fp64", "baseline"):
-        return compute_elbo_only_delta(model, data)
-    raise ValueError(f"Unsupported VBGS precision mode: {precision}")
-
+        out = run_op_elbo_delta(model, data, posteriors=posteriors)
+        if out is not None:
+            return out
+    elif precision not in ("fp64", "baseline"):
+        raise ValueError(
+            f"Unsupported VBGS precision mode: {precision!r} "
+            "(use 'fp64' or 'op'/'optimized' after mixed-precision search)"
+        )
+    return _elbo_delta_jit(model, data, posteriors)
 
 def _gather_components(x, idx):
     flat = x.reshape((x.shape[0], -1))
@@ -285,6 +208,9 @@ def _topm_indices(initial_model, xi, top_m):
 
 
 def _candidate_topm_indices(initial_model, xi, candidate_idx, top_m):
+    k = min(int(top_m), int(candidate_idx.shape[1]))
+    if _EUCLIDEAN_CANDIDATE_RANK:
+        return candidate_idx[:, :k]
     x = xi[:, :3, :]
     mean = initial_model.mixture.likelihood.mean
     inv_sigma = initial_model.mixture.likelihood.expected_inv_sigma()
@@ -292,7 +218,6 @@ def _candidate_topm_indices(initial_model, xi, candidate_idx, top_m):
     cand_inv_sigma = _gather_components(inv_sigma, candidate_idx)
     diff = x[:, None, :, :] - cand_mean
     maha = (diff.mT @ cand_inv_sigma @ diff)[..., 0, 0]
-    k = min(int(top_m), int(candidate_idx.shape[1]))
     _, local_idx = jax.lax.top_k(-maha, k)
     return jnp.take_along_axis(candidate_idx, local_idx, axis=1)
 
@@ -408,8 +333,7 @@ class _TopmCache:
 
 
 def _precision_dtype(precision):
-    if precision in ("fp32", "tf32"):
-        return jnp.float32
+    del precision
     return None
 
 
@@ -443,12 +367,18 @@ def build_topm_cache(initial_model, precision="fp64"):
     )
 
 
+# If True, keep first top_m KD-tree (Euclidean) candidates; skip Mahalanobis re-rank.
+_EUCLIDEAN_CANDIDATE_RANK = os.environ.get("VBGS_EUCLIDEAN_CANDIDATE_RANK", "0") == "1"
+
+
 def _candidate_topm_indices_cached(mean, inv_sigma, x_space, candidate_idx, top_m):
+    k = min(int(top_m), int(candidate_idx.shape[1]))
+    if _EUCLIDEAN_CANDIDATE_RANK:
+        return candidate_idx[:, :k]
     cand_mean = _gather_components(mean, candidate_idx)
     cand_inv_sigma = _gather_components(inv_sigma, candidate_idx)
     diff = x_space[:, None, :, :] - cand_mean
     maha = (diff.mT @ cand_inv_sigma @ diff)[..., 0, 0]
-    k = min(int(top_m), int(candidate_idx.shape[1]))
     _, local_idx = jax.lax.top_k(-maha, k)
     return jnp.take_along_axis(candidate_idx, local_idx, axis=1)
 
@@ -590,6 +520,7 @@ def fit_gmm_step(
     top_m=None,
     candidate_indices=None,
     topm_cache=None,
+    use_topm_cache=True,
     low_elbo_count=0,
 ):
     """
@@ -624,7 +555,12 @@ def fit_gmm_step(
 
     # The sparse E-step reads only run-constant quantities of initial_model, so
     # build them once here instead of recomputing dense (N,3,3) stats per batch.
-    if top_m is not None and candidate_indices is not None and topm_cache is None:
+    if (
+        use_topm_cache
+        and top_m is not None
+        and candidate_indices is not None
+        and topm_cache is None
+    ):
         topm_cache = build_topm_cache(initial_model, precision=precision)
 
     low_elbo_count = int(low_elbo_count or 0)
@@ -652,7 +588,7 @@ def fit_gmm_step(
         )
 
         elbo = None
-        if sparse_path and candidate_idx is not None:
+        if sparse_path and candidate_idx is not None and topm_cache is not None:
             # Compare against a device scalar so changing `size` does not bake a
             # new constant into the compiled graph.
             valid_mask = jnp.arange(batch_size) < jnp.asarray(size, dtype=jnp.int32)
@@ -689,6 +625,11 @@ def fit_gmm_step(
                     int(topm_cache.semantic_dim),
                     int(topm_cache.n_sem),
                 )
+        elif sparse_path and candidate_idx is not None:
+            ps, ss, cs, sems = compute_candidate_topm_stats(
+                initial_model, xi[:size], candidate_idx[:size], int(top_m)
+            )
+            elbo = None
         elif top_m is not None:
             ps, ss, cs, sems, elbo = compute_topm_stats(
                 initial_model, xi[:size], int(top_m)
@@ -703,15 +644,15 @@ def fit_gmm_step(
                     [xi, jnp.zeros((batch_size - size, *xi.shape[1:]))],
                     axis=0,
                 )
-                elbo, posteriors = compute_elbo_delta_with_precision(
-                    initial_model, xi, precision
+                elbo, posteriors = compute_elbo_delta(
+                    initial_model, xi, precision=precision
                 )
                 xi = xi[:size]
                 elbo = elbo[:size]
                 posteriors = posteriors[:size]
             else:
-                elbo, posteriors = compute_elbo_delta_with_precision(
-                    initial_model, xi, precision
+                elbo, posteriors = compute_elbo_delta(
+                    initial_model, xi, precision=precision
                 )
 
             cat_i = initial_model.mixture.expand_to_categorical_dims(xi)
@@ -739,6 +680,9 @@ def fit_gmm_step(
                 low_elbo_idcs.append(local_idcs + batch_start)
                 low_elbo_values.append(batch_elbo[local_idcs])
 
+        # --- M-step: accumulate responsibility-weighted sufficient statistics ---
+        # (Sparse E-step kernels already scatter ps/ss/cs; dense path builds them
+        # above via _to_stats / get_likelihood_sst.)
         if batch_idx == 0 and prior_stats is None:
             prior_stats = ps
             space_stats = ss
@@ -751,6 +695,7 @@ def fit_gmm_step(
             if sems is not None:
                 semantic_stats = utils.apply_add(sems, semantic_stats)
 
+    # --- M-step: closed-form conjugate posterior update ---
     model.mixture.prior.update_from_statistics(
         prior_stats, **initial_model.mixture.pi_opts
     )

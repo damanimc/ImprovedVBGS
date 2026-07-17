@@ -19,7 +19,7 @@ from vbgs.model.jaxpr_precision import (
     trace_function,
     white_noise_batch,
 )
-from vbgs.model.train import _compute_elbo_delta_impl, _compute_elbo_only_delta_impl
+from vbgs.model.train import _elbo_delta_jit
 from vbgs.vi.sum_stats_fused import fused_weighted_sum
 
 
@@ -83,12 +83,20 @@ def set_precision_runtime(bundle: PrecisionBundle | None):
 
 
 def _trace_elbo(model, data) -> TracedFunction:
-    return trace_function("compute_elbo_delta", _compute_elbo_delta_impl, model, data)
+    return trace_function(
+        "compute_elbo_delta",
+        lambda m, d: _elbo_delta_jit(m, d, True),
+        model,
+        data,
+    )
 
 
 def _trace_elbo_only(model, data) -> TracedFunction:
     return trace_function(
-        "compute_elbo_only_delta", _compute_elbo_only_delta_impl, model, data
+        "compute_elbo_only_delta",
+        lambda m, d: _elbo_delta_jit(m, d, False),
+        model,
+        data,
     )
 
 
@@ -126,6 +134,7 @@ def compile_precision_bundle(
     output_dir: str | Path | None = None,
     white_noise_key=None,
     search: bool = True,
+    search_mode: str = "full",
 ) -> PrecisionBundle:
     if white_noise_key is None:
         white_noise_key = jr.PRNGKey(0)
@@ -159,19 +168,25 @@ def compile_precision_bundle(
             elbo_only_path = output_dir / "compute_elbo_only_delta.opmap.json"
             sum_path = output_dir / "sum_stats_over_samples.opmap.json"
         bundle.elbo_map = search_op_precision_map(
-            bundle.elbo_traced, (model, noise), tolerance=tolerance, path=elbo_path
+            bundle.elbo_traced,
+            (model, noise),
+            tolerance=tolerance,
+            path=elbo_path,
+            mode=search_mode,
         )
         bundle.elbo_only_map = search_op_precision_map(
             bundle.elbo_only_traced,
             (model, noise),
             tolerance=tolerance,
             path=elbo_only_path,
+            mode=search_mode,
         )
         bundle.sum_stats_map = search_op_precision_map(
             bundle.sum_stats_traced,
             (noise_leaf, noise_weights),
             tolerance=tolerance,
             path=sum_path,
+            mode=search_mode,
         )
     if output_dir is not None:
         bundle.save(output_dir)
@@ -199,30 +214,23 @@ def load_precision_bundle(
     return bundle
 
 
-def run_elbo_delta(model, data):
-    bundle = get_precision_runtime()
-    if bundle is None or bundle.elbo_runner is None:
-        from vbgs.model.train import compute_elbo_delta
-
-        return compute_elbo_delta(model, data)
-    outs = bundle.elbo_runner(model, data)
+def _unpack_elbo_runner_output(outs, posteriors: bool):
     if isinstance(outs, (list, tuple)):
-        if len(outs) == 2:
+        if posteriors and len(outs) >= 2:
             return outs[0], outs[1]
         return outs[0]
     return outs
 
 
-def run_elbo_only_delta(model, data):
+def run_op_elbo_delta(model, data, posteriors=True):
+    """Run a compiled op-level ELBO kernel, or ``None`` if no runtime is active."""
     bundle = get_precision_runtime()
-    if bundle is None or bundle.elbo_only_runner is None:
-        from vbgs.model.train import compute_elbo_only_delta
-
-        return compute_elbo_only_delta(model, data)
-    outs = bundle.elbo_only_runner(model, data)
-    if isinstance(outs, (list, tuple)):
-        return outs[0]
-    return outs
+    if bundle is None:
+        return None
+    runner = bundle.elbo_runner if posteriors else bundle.elbo_only_runner
+    if runner is None:
+        return None
+    return _unpack_elbo_runner_output(runner(model, data), posteriors)
 
 
 def run_fused_sum_stats(leaf_array, weights, event_dim: int):

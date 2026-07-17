@@ -10,6 +10,7 @@ from pathlib import Path
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
+import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 from tqdm import tqdm
@@ -31,9 +32,14 @@ from vbgs.model.continual import (
     strict_unused_count,
 )
 from vbgs.model.densify import densify_from_frame
-from vbgs.model.eval import eval_elbo
+# from vbgs.model.eval import eval_elbo
+from vbgs.model.jaxpr_precision import DEFAULT_TOLERANCE
+from vbgs.model.precision_training import ensure_op_precision_runtime
 from vbgs.model.reassign import reassign
-from vbgs.model.train import fit_gmm_step
+from vbgs.model.train import (
+    compute_candidate_topm_elbo_cached,
+    fit_gmm_step,
+)
 
 
 def parse_args():
@@ -55,10 +61,59 @@ def parse_args():
     parser.add_argument("--eval-subsample", type=int, default=None)
     parser.add_argument("--subsample", type=int, default=None)
     parser.add_argument("--semantic-classes", type=int, default=0)
-    parser.add_argument("--precision", choices=["fp64", "fp32", "tf32"], default="fp64")
+    parser.add_argument(
+        "--precision",
+        choices=["fp64", "auto", "op"],
+        default="fp64",
+        help="fp64 baseline, or auto/op for Zaino-style op-level mixed-precision search",
+    )
+    parser.add_argument(
+        "--precision-search-frame",
+        type=int,
+        default=0,
+        help="Frame index at which auto mode compiles op-precision maps",
+    )
+    parser.add_argument(
+        "--precision-tolerance",
+        type=float,
+        default=DEFAULT_TOLERANCE,
+        help="Relative-error gate for op-precision search",
+    )
+    parser.add_argument(
+        "--precision-map-dir",
+        type=Path,
+        default=None,
+        help="Directory for precision_bundle.json (default: <output-dir>/precision_maps)",
+    )
+    parser.add_argument(
+        "--precision-search-batch-size",
+        type=int,
+        default=None,
+        help="Batch size used only for op-precision search/load probes "
+        "(default: training --batch-size)",
+    )
+    parser.add_argument(
+        "--precision-search-mode",
+        choices=["homogeneous", "full"],
+        default="homogeneous",
+        help="homogeneous: fast tolerance gate over fp32/tf32/fp64 (default); "
+        "full: expensive per-equation three-pass search",
+    )
     parser.add_argument("--top-m", type=int, default=32)
     parser.add_argument("--candidate-m", type=int, default=128)
     parser.add_argument("--candidate-eps", type=float, default=0.0)
+    parser.add_argument(
+        "--topm-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cache run-constant sparse E-step statistics",
+    )
+    parser.add_argument(
+        "--fused-stats",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use fused sufficient-statistics contraction",
+    )
     parser.add_argument("--init", choices=["random", "first-frame", "full-data"], default="random")
     parser.add_argument("--init-downsample-factor", type=int, default=None)
     parser.add_argument("--densify", action=argparse.BooleanOptionalAction, default=False)
@@ -70,6 +125,24 @@ def parse_args():
     parser.add_argument("--reassign", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--reassign-every", type=int, default=1)
     parser.add_argument("--reassign-fraction", type=float, default=0.05)
+    parser.add_argument(
+        "--static-reassign-shape",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pad reassignment indices to a fixed JAX compile shape",
+    )
+    parser.add_argument(
+        "--reassign-reuse-sparse-elbo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse sparse-fit low-ELBO points for reassignment; disable to rescan dense ELBO",
+    )
+    parser.add_argument(
+        "--reassign-before-fit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reassign before CAVI so relocated components get same-frame evidence",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=None)
@@ -157,6 +230,94 @@ def load_frame_and_candidates(
     )
 
 
+def collect_sparse_low_elbo(
+    data,
+    candidate_indices,
+    topm_cache,
+    top_m,
+    batch_size,
+    low_elbo_count,
+):
+    """Score current frame with sparse top-M ELBO (no model update)."""
+    low_elbo_count = int(low_elbo_count)
+    if (
+        low_elbo_count <= 0
+        or topm_cache is None
+        or candidate_indices is None
+        or top_m is None
+    ):
+        return {
+            "point_indices": np.asarray([], dtype=np.int64),
+            "elbo": np.asarray([], dtype=np.float64),
+        }
+    low_elbo_idcs = []
+    low_elbo_values = []
+    if data.shape[0] == 0 or batch_size <= 0:
+        return {
+            "point_indices": np.asarray([], dtype=np.int64),
+            "elbo": np.asarray([], dtype=np.float64),
+        }
+    n_batches = int(np.ceil(data.shape[0] / batch_size))
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
+        xi_np = data[batch_start : batch_start + batch_size]
+        ci_np = candidate_indices[batch_start : batch_start + batch_size]
+        size = int(xi_np.shape[0])
+        if size <= 0:
+            continue
+        if size < batch_size:
+            pad = batch_size - size
+            xi_np = np.concatenate(
+                [xi_np, np.zeros((pad, xi_np.shape[1]), dtype=xi_np.dtype)],
+                axis=0,
+            )
+            ci_np = np.concatenate(
+                [ci_np, np.zeros((pad, ci_np.shape[1]), dtype=ci_np.dtype)],
+                axis=0,
+            )
+        xi = jnp.expand_dims(jnp.asarray(xi_np), -1)
+        elbo = compute_candidate_topm_elbo_cached(
+            topm_cache.space,
+            topm_cache.color,
+            topm_cache.semantic,
+            topm_cache.prior_log_mean,
+            topm_cache.mean,
+            topm_cache.inv_sigma,
+            xi,
+            jnp.asarray(ci_np, dtype=jnp.int32),
+            int(top_m),
+            int(topm_cache.space_dim),
+            int(topm_cache.color_dim),
+            int(topm_cache.semantic_dim),
+            int(topm_cache.n_sem),
+        )
+        batch_elbo = np.asarray(jax.block_until_ready(elbo))[:size]
+        keep = min(low_elbo_count, size)
+        if keep <= 0:
+            continue
+        local_idcs = np.argpartition(batch_elbo, keep - 1)[:keep]
+        low_elbo_idcs.append(local_idcs + batch_start)
+        low_elbo_values.append(batch_elbo[local_idcs])
+    if not low_elbo_idcs:
+        return {
+            "point_indices": np.asarray([], dtype=np.int64),
+            "elbo": np.asarray([], dtype=np.float64),
+        }
+    all_idcs = np.concatenate(low_elbo_idcs)
+    all_values = np.concatenate(low_elbo_values)
+    keep = min(low_elbo_count, int(all_values.shape[0]))
+    if keep <= 0:
+        return {
+            "point_indices": np.asarray([], dtype=np.int64),
+            "elbo": np.asarray([], dtype=np.float64),
+        }
+    selected = np.argpartition(all_values, keep - 1)[:keep]
+    return {
+        "point_indices": all_idcs[selected].astype(np.int64),
+        "elbo": all_values[selected],
+    }
+
+
 def frame_record(step, x, *, densify_stats, **timings):
     return {
         "frame": int(step),
@@ -180,6 +341,20 @@ def frame_record(step, x, *, densify_stats, **timings):
 
 def main():
     args = parse_args()
+    os.environ["VBGS_USE_FUSED_STATS"] = "1" if args.fused_stats else "0"
+    top_m = None if args.top_m is None or args.top_m <= 0 else int(args.top_m)
+    candidate_m = (
+        None
+        if args.candidate_m is None or args.candidate_m <= 0 or top_m is None
+        else int(args.candidate_m)
+    )
+    precision_mode = args.precision
+    active_precision = "fp64" if precision_mode == "auto" else precision_mode
+    precision_search_batch = (
+        int(args.precision_search_batch_size)
+        if args.precision_search_batch_size is not None
+        else int(args.batch_size)
+    )
     jax.config.update("jax_default_device", jax.devices()[args.device])
     output = RunOutput.create(
         run_name=args.run_name,
@@ -187,6 +362,7 @@ def main():
         output_dir=args.output_dir,
         unique=args.output_dir is None,
     )
+    precision_map_dir = args.precision_map_dir or (output.path / "precision_maps")
 
     key = jr.PRNGKey(args.seed)
     manifest = load_scene_manifest(args.data_path)
@@ -259,9 +435,10 @@ def main():
 
     candidate_tree, topm_cache = build_sparse_index(
         prior_model,
-        top_m=args.top_m,
-        candidate_m=args.candidate_m,
-        precision=args.precision,
+        top_m=top_m,
+        candidate_m=candidate_m,
+        precision=active_precision,
+        use_topm_cache=args.topm_cache,
     )
     prior_stats, space_stats, color_stats = None, None, None
     metrics = (
@@ -270,10 +447,18 @@ def main():
             "source_type": manifest.get("source_type"),
             "components": args.components,
             "batch_size": args.batch_size,
-            "precision": args.precision,
-            "top_m": args.top_m,
-            "candidate_m": args.candidate_m,
+            "precision": precision_mode,
+            "active_precision": active_precision,
+            "precision_search_frame": args.precision_search_frame,
+            "precision_tolerance": args.precision_tolerance,
+            "precision_search_batch_size": precision_search_batch,
+            "precision_search_mode": args.precision_search_mode,
+            "precision_map_dir": str(precision_map_dir),
+            "top_m": top_m,
+            "candidate_m": candidate_m,
             "candidate_eps": args.candidate_eps,
+            "topm_cache": args.topm_cache,
+            "fused_stats": args.fused_stats,
             "semantic_classes": int(args.semantic_classes),
             "init": args.init,
             **init_metrics,
@@ -286,6 +471,9 @@ def main():
             "reassign": args.reassign,
             "reassign_every": args.reassign_every,
             "reassign_fraction": args.reassign_fraction,
+            "reassign_reuse_sparse_elbo": args.reassign_reuse_sparse_elbo,
+            "reassign_before_fit": args.reassign_before_fit,
+            "static_reassign_shape": args.static_reassign_shape,
             "preload": args.preload,
             "split": train_split,
             "train_frames": len(data_iter),
@@ -301,6 +489,54 @@ def main():
     prefetch_executor = ThreadPoolExecutor(max_workers=1)
     prefetch = None
 
+    def refresh_precision(frame_idx: int, frame_data, *, rng_key):
+        nonlocal active_precision
+        if precision_mode not in ("auto", "op"):
+            active_precision = precision_mode
+            return None, rng_key
+        rng_key, sub = jr.split(rng_key)
+        active_precision, precision_map = ensure_op_precision_runtime(
+            mode=precision_mode,
+            frame_idx=frame_idx,
+            search_frame=args.precision_search_frame,
+            prior_model=prior_model,
+            normalized=frame_data,
+            batch_size=precision_search_batch,
+            output_dir=output.path,
+            tolerance=args.precision_tolerance,
+            white_noise_key=sub,
+            bundle_dir=precision_map_dir,
+            search_mode=args.precision_search_mode,
+        )
+        return precision_map, rng_key
+
+    # Compile/load op-precision maps before the timed train loop so search cost
+    # is treated like initialization (excluded from TRAIN_LOOP_SEC).
+    if precision_mode in ("auto", "op") and args.precision_search_frame <= 0 and n_frames > 0:
+        x0 = data_iter._get_frame(0)
+        print(
+            f"PRECISION_SEARCH_START mode={precision_mode} "
+            f"batch={precision_search_batch} dir={precision_map_dir}",
+            flush=True,
+        )
+        search_t0 = time.perf_counter()
+        precision_map, key = refresh_precision(0, x0, rng_key=key)
+        print(
+            f"PRECISION_SEARCH_SEC={time.perf_counter() - search_t0:.6f} "
+            f"active={active_precision}",
+            flush=True,
+        )
+        if args.debug and precision_map is not None:
+            metrics["precision_map"] = {
+                "compute_elbo_delta": precision_map.compute_elbo_delta,
+                "sum_stats_over_samples": precision_map.sum_stats_over_samples,
+                "selected_reason": precision_map.selected_reason,
+                "mode": precision_map.mode,
+                "tolerance": precision_map.tolerance,
+            }
+            metrics["active_precision"] = active_precision
+
+    train_loop_start = time.perf_counter()
     for step in tqdm(range(n_frames), total=n_frames, desc="training", unit="frame"):
         if prefetch is not None:
             x, candidate_indices = prefetch.result()
@@ -309,10 +545,29 @@ def main():
                 data_iter,
                 step,
                 candidate_tree,
-                args.candidate_m,
+                candidate_m,
                 args.components,
                 args.candidate_eps,
             )
+        if (
+            precision_mode in ("auto", "op")
+            and args.precision_search_frame > 0
+            and step == args.precision_search_frame
+        ):
+            print(
+                f"PRECISION_SEARCH_START mode={precision_mode} frame={step} "
+                f"batch={precision_search_batch}",
+                flush=True,
+            )
+            search_t0 = time.perf_counter()
+            precision_map, key = refresh_precision(step, x, rng_key=key)
+            print(
+                f"PRECISION_SEARCH_SEC={time.perf_counter() - search_t0:.6f} "
+                f"active={active_precision}",
+                flush=True,
+            )
+            if args.debug:
+                metrics["active_precision"] = active_precision
         if args.debug:
             start = time.perf_counter()
             densify_seconds = 0.0
@@ -330,7 +585,7 @@ def main():
                 densify_candidates = query_candidate_indices(
                     candidate_tree,
                     x[:, :3],
-                    args.candidate_m,
+                    candidate_m,
                     args.components,
                 )
                 prior_model, densify_stats, inserted_components = densify_from_frame(
@@ -359,24 +614,82 @@ def main():
                     rebuild_start = time.perf_counter()
                 candidate_tree, topm_cache = build_sparse_index(
                     prior_model,
-                    top_m=args.top_m,
-                    candidate_m=args.candidate_m,
-                    precision=args.precision,
+                    top_m=top_m,
+                    candidate_m=candidate_m,
+                    precision=active_precision,
+                    use_topm_cache=args.topm_cache,
                 )
                 if args.debug:
                     sparse_rebuild_seconds += time.perf_counter() - rebuild_start
 
         if args.debug:
             fit_start = time.perf_counter()
+        do_reassign = (
+            args.reassign
+            and args.reassign_every > 0
+            and step % args.reassign_every == 0
+        )
         low_elbo_count = (
             max(1024, int(args.components * args.reassign_fraction * 4))
-            if (
-                args.reassign
-                and args.reassign_every > 0
-                and step % args.reassign_every == 0
-            )
+            if do_reassign and args.reassign_reuse_sparse_elbo
             else 0
         )
+
+        def _run_reassign(point_indices, point_elbos):
+            nonlocal prior_model, candidate_tree, topm_cache, reassign_seconds
+            nonlocal sparse_rebuild_seconds, candidate_indices
+            if args.debug:
+                reassign_start = time.perf_counter()
+            reassign_batch = (
+                args.batch_size
+                if point_indices is not None
+                else min(int(args.batch_size), 100)
+            )
+            prior_model = reassign(
+                prior_model,
+                model,
+                x,
+                reassign_batch,
+                args.reassign_fraction,
+                precision=active_precision,
+                point_indices=point_indices,
+                point_elbos=point_elbos,
+                static_shape=args.static_reassign_shape,
+            )
+            if args.debug:
+                reassign_seconds = time.perf_counter() - reassign_start
+                rebuild_start = time.perf_counter()
+            candidate_tree, topm_cache = build_sparse_index(
+                prior_model,
+                top_m=top_m,
+                candidate_m=candidate_m,
+                precision=active_precision,
+                use_topm_cache=args.topm_cache,
+            )
+            if args.debug:
+                sparse_rebuild_seconds += time.perf_counter() - rebuild_start
+
+        if do_reassign and args.reassign_before_fit:
+            if low_elbo_count > 0:
+                low_elbo = collect_sparse_low_elbo(
+                    x,
+                    candidate_indices,
+                    topm_cache,
+                    top_m,
+                    args.batch_size,
+                    low_elbo_count,
+                )
+                _run_reassign(low_elbo["point_indices"], low_elbo["elbo"])
+            else:
+                _run_reassign(None, None)
+            candidate_indices = query_candidate_indices(
+                candidate_tree,
+                x[:, :3],
+                candidate_m,
+                args.components,
+                eps=args.candidate_eps,
+            )
+
         fit_result = fit_gmm_step(
             prior_model,
             model,
@@ -385,13 +698,16 @@ def main():
             prior_stats=prior_stats,
             space_stats=space_stats,
             color_stats=color_stats,
-            precision=args.precision,
-            top_m=args.top_m,
+            precision=active_precision,
+            top_m=top_m,
             candidate_indices=candidate_indices,
             topm_cache=topm_cache,
-            low_elbo_count=low_elbo_count,
+            use_topm_cache=args.topm_cache,
+            low_elbo_count=(
+                0 if args.reassign_before_fit else low_elbo_count
+            ),
         )
-        if low_elbo_count:
+        if (not args.reassign_before_fit) and low_elbo_count:
             (
                 model,
                 prior_stats,
@@ -402,30 +718,12 @@ def main():
             ) = fit_result
         else:
             model, prior_stats, space_stats, color_stats, _semantic_stats = fit_result
-        if low_elbo_count:
-            if args.debug:
-                reassign_start = time.perf_counter()
-            prior_model = reassign(
-                prior_model,
-                model,
-                x,
-                args.batch_size,
-                args.reassign_fraction,
-                precision=args.precision,
-                point_indices=low_elbo["point_indices"],
-                point_elbos=low_elbo["elbo"],
+            low_elbo = None
+        if do_reassign and not args.reassign_before_fit:
+            _run_reassign(
+                None if low_elbo is None else low_elbo["point_indices"],
+                None if low_elbo is None else low_elbo["elbo"],
             )
-            if args.debug:
-                reassign_seconds = time.perf_counter() - reassign_start
-                rebuild_start = time.perf_counter()
-            candidate_tree, topm_cache = build_sparse_index(
-                prior_model,
-                top_m=args.top_m,
-                candidate_m=args.candidate_m,
-                precision=args.precision,
-            )
-            if args.debug:
-                sparse_rebuild_seconds += time.perf_counter() - rebuild_start
         jax.block_until_ready(model.mixture.likelihood.mean)
         if step + 1 < n_frames:
             prefetch = prefetch_executor.submit(
@@ -433,7 +731,7 @@ def main():
                 data_iter,
                 step + 1,
                 candidate_tree,
-                args.candidate_m,
+                candidate_m,
                 args.components,
                 args.candidate_eps,
             )
@@ -457,27 +755,33 @@ def main():
             output.checkpoint(model, data_params, f"model_{step:03d}.json")
 
     prefetch_executor.shutdown(wait=False)
+    jax.block_until_ready(model.mixture.likelihood.mean)
+    train_loop_seconds = time.perf_counter() - train_loop_start
+    per_frame_seconds = train_loop_seconds / max(1, n_frames)
+    print(f"TRAIN_LOOP_SEC={train_loop_seconds:.6f}")
+    print(f"PER_FRAME_SEC={per_frame_seconds:.6f}")
+    print(f"ACTIVE_PRECISION={active_precision}")
 
-    if args.eval and has_split(args.data_path, "val"):
-        eval_iter = SceneDataIterator(
-            args.data_path,
-            split="val",
-            data_params=data_params,
-            subsample=None,
-        )
-        eval_frames = [x for x in eval_iter]
-        eval_results = eval_elbo(
-            model,
-            eval_frames,
-            args.eval_batch_size,
-            args.precision,
-            args.eval_subsample,
-            args.seed,
-            top_m=args.top_m,
-            candidate_m=args.candidate_m,
-        )
-        if args.debug:
-            metrics["eval"] = eval_results
+    # if args.eval and has_split(args.data_path, "val"):
+    #     eval_iter = SceneDataIterator(
+    #         args.data_path,
+    #         split="val",
+    #         data_params=data_params,
+    #         subsample=None,
+    #     )
+    #     eval_frames = [x for x in eval_iter]
+    #     eval_results = eval_elbo(
+    #         model,
+    #         eval_frames,
+    #         args.eval_batch_size,
+    #         active_precision,
+    #         args.eval_subsample,
+    #         args.seed,
+    #         top_m=top_m,
+    #         candidate_m=candidate_m,
+    #     )
+    #     if args.debug:
+    #         metrics["eval"] = eval_results
 
     paths = output.final_model(model, data_params, metrics)
     if args.debug:

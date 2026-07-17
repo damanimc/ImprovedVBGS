@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 import equinox as eqx
 
-from vbgs.model.train import compute_elbo_only_delta_with_precision
+from vbgs.model.train import compute_elbo_delta
 
 
 from vbgs.model.feature_layout import N_COLOR, N_SPATIAL
@@ -58,11 +58,15 @@ def reassign(
     elbo_fn=None,
     point_indices=None,
     point_elbos=None,
+    static_shape=True,
 ):
     """
     Heuristic to force better assignments. Takes n points with the lowest elbo,
     and reassigns them to n components that are currently unused.
     n is determined dynamically as a fraction of the unused components.
+
+    When static_shape is True, index arrays are padded to a fixed compile-time
+    length so JAX does not recompile when n_reassign changes across frames.
     """
 
     alpha = np.asarray(jax.block_until_ready(model.prior.alpha))
@@ -115,13 +119,13 @@ def reassign(
                     [xi, jnp.zeros((batch_size - size, *xi.shape[1:]))],
                     axis=0,
                 )
-                elbo = compute_elbo_only_delta_with_precision(
-                    initial_model, xi, precision
+                elbo = compute_elbo_delta(
+                    initial_model, xi, precision=precision, posteriors=False
                 )
                 elbo = elbo[:size]
             else:
-                elbo = compute_elbo_only_delta_with_precision(
-                    initial_model, xi, precision
+                elbo = compute_elbo_delta(
+                    initial_model, xi, precision=precision, posteriors=False
                 )
             elbo_batches.append(elbo)
 
@@ -143,15 +147,22 @@ def reassign(
     if n_reassign <= 0:
         return initial_model
 
-    # Keep JAX scatter shapes fixed across frames; invalid padded slots write no-op values.
-    pad_component = int(np.argmax(alpha))
-    component_idcs = np.full(max_reassign, pad_component, dtype=np.int64)
-    component_idcs[:n_reassign] = np.flatnonzero(unused)[
-        np.argsort(alpha[unused])[:n_reassign]
-    ]
-    padded_point_idcs = np.zeros(max_reassign, dtype=np.int64)
-    padded_point_idcs[:n_reassign] = np.asarray(point_idcs, dtype=np.int64)[:n_reassign]
-    valid_mask = jnp.asarray(np.arange(max_reassign) < n_reassign)
+    unused_idcs = np.flatnonzero(unused)[np.argsort(alpha[unused])[:n_reassign]]
+    point_idcs = np.asarray(point_idcs, dtype=np.int64)[:n_reassign]
+
+    if static_shape:
+        # Keep JAX scatter shapes fixed across frames; padded slots are no-ops.
+        pad_component = int(np.argmax(alpha))
+        component_idcs = np.full(max_reassign, pad_component, dtype=np.int64)
+        component_idcs[:n_reassign] = unused_idcs
+        padded_point_idcs = np.zeros(max_reassign, dtype=np.int64)
+        padded_point_idcs[:n_reassign] = point_idcs
+        valid_mask = jnp.asarray(np.arange(max_reassign) < n_reassign)
+    else:
+        # Dynamic shapes: n_reassign changes every frame and forces recompilation.
+        component_idcs = unused_idcs.astype(np.int64)
+        padded_point_idcs = point_idcs
+        valid_mask = jnp.ones((n_reassign,), dtype=bool)
 
     # Move unused component means to low-ELBO points before the next update.
     s_means = initial_model.likelihood.mean

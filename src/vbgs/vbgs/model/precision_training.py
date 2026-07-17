@@ -44,6 +44,7 @@ def ensure_op_precision_runtime(
     tolerance: float = DEFAULT_TOLERANCE,
     white_noise_key=None,
     bundle_dir: Path | None = None,
+    search_mode: str = "homogeneous",
 ):
     """Compile or load op-level precision maps for the current frame."""
     if mode not in ("auto", "op"):
@@ -86,6 +87,7 @@ def ensure_op_precision_runtime(
         tolerance=tolerance,
         output_dir=bundle_dir,
         white_noise_key=white_noise_key,
+        search_mode=search_mode,
     )
     precision_map = PrecisionMap.from_bundle(bundle)
     precision_map.save(output_dir / "precision_map.json")

@@ -9,10 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from vbgs.model.continual import build_sparse_index, query_candidate_indices
-from vbgs.model.train import (
-    compute_candidate_topm_elbo_cached,
-    compute_elbo_only_delta_with_precision,
-)
+from vbgs.model.train import compute_candidate_topm_elbo_cached, compute_elbo_delta
 
 
 def _pad_batch(xi, batch_size, candidate_idx=None):
@@ -128,7 +125,9 @@ def eval_elbo(
                     int(eval_cache.n_sem),
                 )
             else:
-                elbo = compute_elbo_only_delta_with_precision(model, xi, precision)
+                elbo = compute_elbo_delta(
+                    model, jnp.asarray(xi), precision=precision, posteriors=False
+                )
             values.append(np.asarray(jax.block_until_ready(elbo))[:size])
         values = np.concatenate(values)
         results.append(

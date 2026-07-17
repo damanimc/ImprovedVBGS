@@ -621,12 +621,73 @@ def _latency_aware_pass(
     return current
 
 
-def search_op_precision_map(
+def search_homogeneous_precision_map(
     traced: TracedFunction,
     args: Sequence[Any],
     tolerance: float = DEFAULT_TOLERANCE,
     path: str | Path | None = None,
 ) -> OpPrecisionMap:
+    """Fast tolerance gate over homogeneous precisions.
+
+    The jit runtime currently executes at the dominant homogeneous precision of
+    an op-map, so this searches the same effective space without the expensive
+    per-equation three-pass sweep (needed for large component counts).
+    """
+    fp64_map = {i: "fp64" for i in traced.compute_indices}
+    reference = _run_traced(traced, args, fp64_map)
+    _, ref_seconds = _timed_traced(traced, args, fp64_map)
+
+    selected = "fp64"
+    selected_map = fp64_map
+    selected_err = 0.0
+    selected_seconds = ref_seconds
+    trials = {}
+    for precision in PRECISION_LEVELS[:-1]:  # fp32, then tf32
+        trial_map = {i: precision for i in traced.compute_indices}
+        candidate = _run_traced(traced, args, trial_map)
+        err = relative_error(reference, candidate)
+        _, seconds = _timed_traced(traced, args, trial_map)
+        trials[precision] = {"relative_error": err, "seconds": seconds}
+        if err <= tolerance:
+            selected = precision
+            selected_map = trial_map
+            selected_err = err
+            selected_seconds = seconds
+            break
+
+    op_map = OpPrecisionMap(
+        function=traced.name,
+        tolerance=tolerance,
+        equation_precisions=selected_map,
+        compute_equation_indices=list(traced.compute_indices),
+        posterior_relative_error=selected_err,
+        elbo_relative_error=selected_err,
+        selected_reason=f"homogeneous-{selected}",
+        precision_aware_pass={"choice": selected_map, "trials": trials},
+        structure_aware_pass=None,
+        latency_aware_pass={
+            "choice": selected_map,
+            "fp64_seconds": ref_seconds,
+            "optimized_seconds": selected_seconds,
+        },
+    )
+    if path is not None:
+        op_map.save(path)
+    return op_map
+
+
+def search_op_precision_map(
+    traced: TracedFunction,
+    args: Sequence[Any],
+    tolerance: float = DEFAULT_TOLERANCE,
+    path: str | Path | None = None,
+    mode: str = "full",
+) -> OpPrecisionMap:
+    if mode in ("homogeneous", "fast", "dominant"):
+        return search_homogeneous_precision_map(
+            traced, args, tolerance=tolerance, path=path
+        )
+
     precision_aware = _precision_aware_pass(traced, args, tolerance)
     structure_aware = _structure_aware_pass(traced, args, tolerance, dict(precision_aware))
     latency_aware = _latency_aware_pass(traced, args, dict(structure_aware))

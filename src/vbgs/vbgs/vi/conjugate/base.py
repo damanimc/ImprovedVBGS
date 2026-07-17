@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+import os
 from math import prod
 from typing import Type, Optional, Union
 from jaxtyping import Array
@@ -467,6 +468,10 @@ class Conjugate(Distribution):
         Sums over the sample dimensions of the statistics, which are nested in an arbitrary pytree structure
         """
 
+        def dense_sum_samples(leaf_array):
+            product = leaf_array * weights
+            return product.sum(axis=tuple(sample_dims))
+
         def fused_sum_samples(leaf_array):
             from vbgs.model.precision_runtime import run_fused_sum_stats
 
@@ -480,9 +485,15 @@ class Conjugate(Distribution):
                 w = jnp.transpose(w, perm)
             return run_fused_sum_stats(leaf, w, self.event_dim)
 
+        sum_fn = (
+            fused_sum_samples
+            if os.environ.get("VBGS_USE_FUSED_STATS", "1") != "0"
+            else dense_sum_samples
+        )
+
         def sum_samples_over_leaves(tree):
             return jtu.tree_map(
-                fused_sum_samples,
+                sum_fn,
                 tree,
             )
 
