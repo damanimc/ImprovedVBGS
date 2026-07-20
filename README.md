@@ -2,18 +2,22 @@
 
 **Paper:** [ImprovedVBGS: Real-time Continual Variational Bayes Gaussian Splatting](https://arxiv.org/abs/2607.15542) ([arXiv:2607.15542](https://arxiv.org/abs/2607.15542))
 
-ImprovedVBGS is a faster implementation of VBGS training. Using sparse top-M CAVI
-responsibilities, a densification strategy and improved reassignment. On an NVIDIA 3070Ti a 200 frame training is completed in <1 minute which is a significant improvement (280x) over the baseline ~234 minutes on an NVIDIA A500 which would OOM on 8GB of VRAM. It is also a significant improvement on the follow up paper which reports ~61 minutes on the same hardware (code unavailable).
+ImprovedVBGS accelerates continual VBGS for on-the-fly reconstruction via
+**(i) spatially truncated variational inference** (KD-tree nearest-neighbour
+candidate pruning) and **(ii) improved reassignment** (truncated-ELBO
+forwarding and static-shape padding to avoid JAX recompilation). On an RTX
+3070 Ti, NeRF Synthetic mean per-frame latency drops from 84.0 s to 0.050 s
+(1680×) without reassignment; with static-shape reassignment the paper reports
+0.133 s/frame and 21.42 dB mean validation PSNR.
 
 ![Lego reconstruction](lego.gif)
 
-Current Lego static-reassignment run: 100k components, 200 frames, 2.7 min
-training, 21.42 dB validation PSNR.
+NeRF Synthetic (paper Table 1): 100k components, 200 frames, mean 0.133 s/frame,
+21.42 dB validation PSNR.
 
 ![TUM RGB-D prediction](Tum.png)
 
-Current TUM `freiburg1_xyz` 100k-component unified run, highest-PSNR
-validation prediction.
+TUM `freiburg1_xyz` 100k-component run, highest-PSNR validation prediction.
 
 ## Install
 
@@ -64,10 +68,10 @@ for scene in chair drums ficus hotdog lego materials mic ship; do
 done
 ```
 
-Train Lego with the unified scene trainer:
+Train Lego with the truncated E-step (paper: C=4 KD-tree candidates) and
+static-shape reassignment before fit:
 
 ```bash
-
 cd src/vbgs/scripts
 python train.py \
   --data-path ../../../data/blender/lego \
@@ -75,16 +79,20 @@ python train.py \
   --components 100000 \
   --frames 200 \
   --batch-size 250000 \
-  --top-m 1 \
+  --top-m 4 \
   --candidate-m 4 \
   --init random \
   --no-densify \
   --reassign \
+  --reassign-before-fit \
   --reassign-every 1 \
   --reassign-fraction 0.05 \
   --precision fp64 \
   --no-eval
 ```
+
+`--candidate-m` is the KD-tree truncation width C. `--top-m` is how many of
+those candidates the E-step scores (set equal to C to match the paper).
 
 Train all preprocessed Blender scenes:
 
@@ -96,10 +104,14 @@ for scene in chair drums ficus hotdog lego materials mic ship; do
     --components 100000 \
     --frames 200 \
     --batch-size 250000 \
-    --top-m 1 \
+    --top-m 4 \
     --candidate-m 4 \
     --init random \
     --no-densify \
+    --reassign \
+    --reassign-before-fit \
+    --reassign-every 1 \
+    --reassign-fraction 0.05 \
     --precision fp64 \
     --eval
 done
@@ -137,22 +149,22 @@ python src/preprocess/preprocess.py tum-rgbd \
   --val-stride 3
 ```
 
-Train TUM with the unified scene trainer and the same core sparse settings as
-Lego:
+Train TUM with the same truncated E-step settings as Lego:
 
 ```bash
 cd src/vbgs/scripts
 python train.py \
   --data-path ../../../data/tum/rgbd_dataset_freiburg1_xyz \
- --run-name freiburg1_xyz \
+  --run-name freiburg1_xyz \
   --components 100000 \
   --frames 530 \
   --batch-size 250000 \
-  --top-m 1 \
+  --top-m 4 \
   --candidate-m 4 \
   --init random \
   --no-densify \
   --reassign \
+  --reassign-before-fit \
   --reassign-every 1 \
   --reassign-fraction 0.05 \
   --precision fp64 \
