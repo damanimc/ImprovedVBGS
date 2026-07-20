@@ -4,20 +4,14 @@
 
 ImprovedVBGS accelerates continual VBGS for on-the-fly reconstruction via
 **(i) spatially truncated variational inference** (KD-tree nearest-neighbour
-candidate pruning) and **(ii) improved reassignment** (truncated-ELBO
-forwarding and static-shape padding to avoid JAX recompilation). On an RTX
-3070 Ti, NeRF Synthetic mean per-frame latency drops from 84.0 s to 0.050 s
-(1680×) without reassignment; with static-shape reassignment the paper reports
-0.133 s/frame and 21.42 dB mean validation PSNR.
+candidate pruning) and **(ii) improved reassignment**. On an RTX
+3070 Ti, NeRF Synthetic mean per-frame latency drops from 84.0 s/frame to 0.050 s/frame
+(1680×) without reassignment.
 
 ![Lego reconstruction](lego.gif)
 
 NeRF Synthetic (paper Table 1): 100k components, 200 frames, mean 0.133 s/frame,
 21.42 dB validation PSNR.
-
-![TUM RGB-D prediction](Tum.png)
-
-TUM `freiburg1_xyz` 100k-component run, highest-PSNR validation prediction.
 
 ## Install
 
@@ -126,50 +120,6 @@ python eval.py \
   --save-images
 ```
 
-## TUM RGB-D
-
-Download the TUM `freiburg1_xyz` sequence:
-
-```bash
-mkdir -p data/tum
-wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_xyz.tgz \
-  -O data/tum/rgbd_dataset_freiburg1_xyz.tgz
-tar -xzf data/tum/rgbd_dataset_freiburg1_xyz.tgz -C data/tum
-```
-
-Preprocess into the same folder (adds `train/`, `val/`, and `transforms_*.json`
-alongside the raw TUM files):
-
-```bash
-python src/preprocess/preprocess.py tum-rgbd \
-  --input data/tum/rgbd_dataset_freiburg1_xyz \
-  --output data/tum/rgbd_dataset_freiburg1_xyz \
-  --frames 798 \
-  --stride 1 \
-  --val-stride 3
-```
-
-Train TUM with the same truncated E-step settings as Lego:
-
-```bash
-cd src/vbgs/scripts
-python train.py \
-  --data-path ../../../data/tum/rgbd_dataset_freiburg1_xyz \
-  --run-name freiburg1_xyz \
-  --components 100000 \
-  --frames 530 \
-  --batch-size 250000 \
-  --top-m 4 \
-  --candidate-m 4 \
-  --init random \
-  --no-densify \
-  --reassign \
-  --reassign-before-fit \
-  --reassign-every 1 \
-  --reassign-fraction 0.05 \
-  --precision fp64 \
-  --no-eval
-```
 
 ## Standard Scene Format
 
@@ -227,12 +177,6 @@ python src/preprocess/preprocess.py video \
 
 `--depth-source placeholder` or `--pose-source stationary` are smoke-test modes
 only and should not be used for reconstruction results.
-
-## Semantic Variant
-
-Semantic training appends continuous SAM/CLIP feature vectors after `[xyz, rgb]`.
-Those features are another VBGS observation block and are updated by CAVI using
-the same responsibilities as color.
 
 ## Citation
 
