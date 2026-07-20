@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: If you use this software, please cite the paper below.
+title: ImprovedVBGS
+authors:
+  - family-names: Mguni-Coker
+    given-names: Damani
+url: https://github.com/damanimc/ImprovedVBGS
+repository-code: https://github.com/damanimc/ImprovedVBGS
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Mguni-Coker
+      given-names: Damani
+  title: "ImprovedVBGS: Real-time Continual Variational Bayes Gaussian Splatting"
+  year: 2026
+  journal: arXiv
+  doi: 10.48550/arXiv.2607.15542
+  url: https://arxiv.org/abs/2607.15542
+  identifiers:
+    - type: other
+      value: arXiv:2607.15542
+      description: arXiv preprint identifier

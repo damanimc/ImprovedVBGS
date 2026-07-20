@@ -1,5 +1,7 @@
 # Improved Variational Bayes Gaussian Splatting
 
+**Paper:** [ImprovedVBGS: Real-time Continual Variational Bayes Gaussian Splatting](https://arxiv.org/abs/2607.15542) ([arXiv:2607.15542](https://arxiv.org/abs/2607.15542))
+
 ImprovedVBGS is a faster implementation of VBGS training. Using sparse top-M CAVI
 responsibilities, a densification strategy and improved reassignment. On an NVIDIA 3070Ti a 200 frame training is completed in <1 minute which is a significant improvement (280x) over the baseline ~234 minutes on an NVIDIA A500 which would OOM on 8GB of VRAM. It is also a significant improvement on the follow up paper which reports ~61 minutes on the same hardware (code unavailable).
 
@@ -220,8 +222,25 @@ Semantic training appends continuous SAM/CLIP feature vectors after `[xyz, rgb]`
 Those features are another VBGS observation block and are updated by CAVI using
 the same responsibilities as color.
 
+## Citation
+
+If you use this code, please cite:
+
+```bibtex
+@misc{mgunicoker2026improvedvbgsrealtimecontinualvariational,
+      title={ImprovedVBGS: Real-time Continual Variational Bayes Gaussian Splatting},
+      author={Damani Mguni-Coker},
+      year={2026},
+      eprint={2607.15542},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2607.15542},
+}
+```
+
 ## References
 
+- ImprovedVBGS: [arXiv:2607.15542](https://arxiv.org/abs/2607.15542)
 - VBGS: [arXiv:2410.03592](https://arxiv.org/abs/2410.03592)
 - VBGS optimization study: [arXiv:2603.08499](https://arxiv.org/abs/2603.08499)
 
