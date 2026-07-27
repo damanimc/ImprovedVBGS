@@ -200,6 +200,7 @@ If you use this code, please cite:
 - VBGS: [arXiv:2410.03592](https://arxiv.org/abs/2410.03592)
 - VBGS optimization study: [arXiv:2603.08499](https://arxiv.org/abs/2603.08499)
 - Ray-space VBGS derivation (draft theory): [`docs/theory/ray_space_vbgs.md`](docs/theory/ray_space_vbgs.md)
+- Lego CPU train/eval PSNR notes: [`docs/theory/lego_ray_space_results.md`](docs/theory/lego_ray_space_results.md)
 
 ## License
 
