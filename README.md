@@ -199,6 +199,7 @@ If you use this code, please cite:
 - ImprovedVBGS: [arXiv:2607.15542](https://arxiv.org/abs/2607.15542)
 - VBGS: [arXiv:2410.03592](https://arxiv.org/abs/2410.03592)
 - VBGS optimization study: [arXiv:2603.08499](https://arxiv.org/abs/2603.08499)
+- Ray-space VBGS derivation (draft theory): [`docs/theory/ray_space_vbgs.md`](docs/theory/ray_space_vbgs.md)
 
 ## License
 
