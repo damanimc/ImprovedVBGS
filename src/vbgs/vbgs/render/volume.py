@@ -225,8 +225,11 @@ def construct_covariance(lower, device="cuda:0"):
     return cov
 
 
-def vbgs_model_to_splat(
-    model_path,
+def arrays_to_splat(
+    mu,
+    si,
+    alpha,
+    n_semantic=0,
     device="cuda:0",
     dtype=torch.float32,
     opacity_threshold=1e-6,
@@ -235,12 +238,10 @@ def vbgs_model_to_splat(
     scale_multiplier=1.41,
     color_mode="rgb",
 ):
-    with open(model_path, "r") as f:
-        d = json.load(f)
-
-    mu, si = np.array(d["mu"]), np.array(d["si"])
-    alpha = np.array(d["alpha"])
-    n_semantic = int(d.get("n_semantic", 0))
+    """Build a graphdeco GaussianModel from denormalized VBGS arrays."""
+    mu = np.asarray(mu)
+    si = np.asarray(si)
+    alpha = np.asarray(alpha)
 
     scaling, rotation = covariance_to_scaling_rotation(si[:, :3, :3])
     scaling = scaling * float(scale_multiplier)
@@ -278,6 +279,34 @@ def vbgs_model_to_splat(
     model.scaling_activation = lambda x: x
     model._rotation = torch.tensor(rotation[mask], dtype=dtype, device=device)
     return model
+
+
+def vbgs_model_to_splat(
+    model_path,
+    device="cuda:0",
+    dtype=torch.float32,
+    opacity_threshold=1e-6,
+    max_opacity=0.95,
+    max_scale_percentile=None,
+    scale_multiplier=1.41,
+    color_mode="rgb",
+):
+    with open(model_path, "r") as f:
+        d = json.load(f)
+
+    return arrays_to_splat(
+        np.array(d["mu"]),
+        np.array(d["si"]),
+        np.array(d["alpha"]),
+        n_semantic=int(d.get("n_semantic", 0)),
+        device=device,
+        dtype=dtype,
+        opacity_threshold=opacity_threshold,
+        max_opacity=max_opacity,
+        max_scale_percentile=max_scale_percentile,
+        scale_multiplier=scale_multiplier,
+        color_mode=color_mode,
+    )
 
 
 def save_inria_splat_ply(model_path, ply_path, **kwargs):

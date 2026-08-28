@@ -147,6 +147,24 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument(
+        "--preview-every",
+        type=int,
+        default=None,
+        help="Save a fixed-viewpoint RGB preview PNG every N training frames "
+        "(for progress gifs). Uses 3DGEER if installed, else graphdeco.",
+    )
+    parser.add_argument(
+        "--preview-split",
+        default="transforms_val.json",
+        help="Transforms JSON for the fixed preview camera",
+    )
+    parser.add_argument(
+        "--preview-index",
+        type=int,
+        default=0,
+        help="Frame index inside --preview-split for the fixed camera",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Record per-frame timings and write metrics.json",
@@ -489,6 +507,23 @@ def main():
     prefetch_executor = ThreadPoolExecutor(max_workers=1)
     prefetch = None
 
+    preview = None
+    preview_dir = None
+    if args.preview_every is not None and args.preview_every > 0:
+        from vbgs.render.preview import FixedViewPreview
+
+        preview = FixedViewPreview(
+            args.data_path,
+            split_json=args.preview_split,
+            index=args.preview_index,
+        )
+        preview_dir = output.image_dir("preview")
+        output.ensure_dir(preview_dir)
+        print(
+            f"preview: every {args.preview_every} frame(s) "
+            f"cam={args.preview_split}[{args.preview_index}] -> {preview_dir}"
+        )
+
     def refresh_precision(frame_idx: int, frame_data, *, rng_key):
         nonlocal active_precision
         if precision_mode not in ("auto", "op"):
@@ -753,6 +788,10 @@ def main():
             )
         if args.save_every is not None and (step + 1) % args.save_every == 0:
             output.checkpoint(model, data_params, f"model_{step:03d}.json")
+        if preview is not None and (step + 1) % args.preview_every == 0:
+            preview.save_png(
+                model, data_params, preview_dir / f"step_{step:03d}.png"
+            )
 
     prefetch_executor.shutdown(wait=False)
     jax.block_until_ready(model.mixture.likelihood.mean)
