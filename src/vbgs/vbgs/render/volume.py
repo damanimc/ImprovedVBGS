@@ -134,70 +134,74 @@ def render_topdown(model, model_path, variant="below_z", bg=0, scale=1.0, **came
 
 
 def rot_mat_to_quat(matrix):
-    trace = np.trace(matrix)
-    if trace > 0:
-        s = math.sqrt(trace + 1.0) * 2.0
-        quat = [
-            0.25 * s,
-            (matrix[2, 1] - matrix[1, 2]) / s,
-            (matrix[0, 2] - matrix[2, 0]) / s,
-            (matrix[1, 0] - matrix[0, 1]) / s,
-        ]
-    else:
-        axis = int(np.argmax(np.diag(matrix)))
-        if axis == 0:
-            s = math.sqrt(max(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2], 1e-8)) * 2.0
+    """Shepperd: 3x3 or (N,3,3) → (w,x,y,z)."""
+    m = np.asarray(matrix, dtype=np.float64)
+    single = m.ndim == 2
+    if single:
+        m = m[None]
+    n = int(m.shape[0])
+    out = np.empty((n, 4), dtype=np.float64)
+    for i in range(n):
+        matrix = m[i]
+        trace = np.trace(matrix)
+        if trace > 0:
+            s = math.sqrt(trace + 1.0) * 2.0
             quat = [
+                0.25 * s,
                 (matrix[2, 1] - matrix[1, 2]) / s,
-                0.25 * s,
-                (matrix[0, 1] + matrix[1, 0]) / s,
-                (matrix[0, 2] + matrix[2, 0]) / s,
-            ]
-        elif axis == 1:
-            s = math.sqrt(max(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2], 1e-8)) * 2.0
-            quat = [
                 (matrix[0, 2] - matrix[2, 0]) / s,
-                (matrix[0, 1] + matrix[1, 0]) / s,
-                0.25 * s,
-                (matrix[1, 2] + matrix[2, 1]) / s,
+                (matrix[1, 0] - matrix[0, 1]) / s,
             ]
         else:
-            s = math.sqrt(max(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1], 1e-8)) * 2.0
-            quat = [
-                (matrix[1, 0] - matrix[0, 1]) / s,
-                (matrix[0, 2] + matrix[2, 0]) / s,
-                (matrix[1, 2] + matrix[2, 1]) / s,
-                0.25 * s,
-            ]
-    quat = np.asarray(quat, dtype=np.float32)
-    norm = np.linalg.norm(quat)
-    return quat / max(norm, 1e-8)
+            axis = int(np.argmax(np.diag(matrix)))
+            if axis == 0:
+                s = math.sqrt(max(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2], 1e-8)) * 2.0
+                quat = [
+                    (matrix[2, 1] - matrix[1, 2]) / s,
+                    0.25 * s,
+                    (matrix[0, 1] + matrix[1, 0]) / s,
+                    (matrix[0, 2] + matrix[2, 0]) / s,
+                ]
+            elif axis == 1:
+                s = math.sqrt(max(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2], 1e-8)) * 2.0
+                quat = [
+                    (matrix[0, 2] - matrix[2, 0]) / s,
+                    (matrix[0, 1] + matrix[1, 0]) / s,
+                    0.25 * s,
+                    (matrix[1, 2] + matrix[2, 1]) / s,
+                ]
+            else:
+                s = math.sqrt(max(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1], 1e-8)) * 2.0
+                quat = [
+                    (matrix[1, 0] - matrix[0, 1]) / s,
+                    (matrix[0, 2] + matrix[2, 0]) / s,
+                    (matrix[1, 2] + matrix[2, 1]) / s,
+                    0.25 * s,
+                ]
+        q = np.asarray(quat, dtype=np.float64)
+        out[i] = q / max(float(np.linalg.norm(q)), 1e-8)
+    out = out.astype(np.float32)
+    return out[0] if single else out
 
 
 def covariance_to_scaling_rotation(covariance):
-    scales = []
-    rotations = []
-    eye = np.eye(3, dtype=np.float32)
-    for cov in covariance:
-        cov = 0.5 * (cov + cov.T)
-        jitter = 1e-10
-        for _ in range(5):
-            try:
-                mat_l = np.linalg.cholesky(cov + eye * jitter)
-                break
-            except np.linalg.LinAlgError:
-                jitter *= 10.0
-        else:
-            values, vectors = np.linalg.eigh(cov)
-            values = np.clip(values, 1e-10, None)
-            mat_l = vectors @ np.diag(np.sqrt(values))
+    """NIW Σ → 3DGS (scale, quat). Eigenframe, not Cholesky.
 
-        scale = np.linalg.norm(mat_l, axis=-1)
-        scale = np.clip(scale, 1e-10, None)
-        rotation = mat_l / scale[:, None]
-        scales.append(scale)
-        rotations.append(rot_mat_to_quat(rotation))
-    return np.asarray(scales, dtype=np.float32), np.asarray(rotations, dtype=np.float32)
+    3DGS builds Σ = R diag(s²) Rᵀ. Cholesky L is world-triangular; row-normalizing
+    it is not R. Axis-aligned pancakes luck out; yawed/tilted ones twist.
+    """
+    cov = np.asarray(covariance, dtype=np.float64)
+    if cov.ndim == 2:
+        cov = cov[None]
+    cov = 0.5 * (cov + np.swapaxes(cov, -1, -2))
+    w, v = np.linalg.eigh(cov)
+    w = np.clip(w, 1e-18, None)
+    scales = np.sqrt(w)
+    det = np.linalg.det(v)
+    v = np.array(v, copy=True)
+    v[det < 0.0, :, 0] *= -1.0
+    quats = rot_mat_to_quat(v)
+    return scales.astype(np.float32), np.asarray(quats, dtype=np.float32)
 
 
 def alpha_to_opacity(alpha, threshold=1e-6, max_opacity=0.95):

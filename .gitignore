@@ -45,7 +45,9 @@ desktop.ini
 # Reference PDFs (large, not versioned)
 papers/
 writeup/
-data/
+# Dataset dumps at repo root only. Do not use a bare `data/` rule —
+# that also hid src/vbgs/vbgs/data (the Python package; GitHub issue #2).
+/data/
 # External dependency checkouts
 third_party/
 # Ignore ripped data folder

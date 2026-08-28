@@ -42,8 +42,9 @@ semantic = [
     "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
 ]
 
-[tool.setuptools]
-py-modules = ["vbgs"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vbgs*"]
 
 
 [tool.ruff]
