@@ -13,6 +13,12 @@ candidate pruning) and **(ii) improved reassignment**. On an RTX
 NeRF Synthetic (paper Table 1): 100k components, 200 frames, mean 0.133 s/frame,
 21.42 dB validation PSNR.
 
+**Rendering tip:** eval with Bosch [3DGEER](https://github.com/boschresearch/3dgeer)
+(`geer-rasterizer`, pinhole / PH mode) raised measured Lego val PSNR from
+**21.88 dB** (graphdeco `diff-gaussian-rasterization`) to **22.16 dB** (+0.28 dB)
+on the same trained model. Training is unchanged; only the eval rasterizer swaps.
+See [Eval with 3DGEER](#eval-with-3dgeer).
+
 ## Install
 
 Requirements: Python 3.11, CUDA GPU, JAX CUDA build.
@@ -111,7 +117,7 @@ for scene in chair drums ficus hotdog lego materials mic ship; do
 done
 ```
 
-Evaluate and save renders:
+Evaluate and save renders (default graphdeco rasterizer):
 
 ```bash
 python eval.py \
@@ -120,6 +126,40 @@ python eval.py \
   --save-images
 ```
 
+### Eval with 3DGEER
+
+[3DGEER](https://github.com/boschresearch/3dgeer) (ICLR 2026) replaces the CUDA
+Gaussian rasterizer with an exact projective / efficient backend. For pinhole
+NeRF Synthetic eval it can improve PSNR slightly without retraining.
+
+Install (after `install_deps.sh`; clones into `third_party/3dgeer`):
+
+```bash
+cd src/vbgs
+bash install_3dgeer.sh
+```
+
+Eval with the PH-mode adapter (do **not** use plain `eval.py` while geer is
+installed — the CUDA settings API differs):
+
+```bash
+cd src/vbgs/scripts
+python eval_3dgeer.py \
+  ../output/lego/model_final.json \
+  --data-path ../../data/blender/lego \
+  --save-images
+```
+
+Writes `val_psnr_3dgeer.json` (and optional `renders_val_3dgeer*`).
+
+Restore the default graphdeco rasterizer if you need `eval.py` again:
+
+```bash
+cd third_party/gaussian-splatting/submodules/diff-gaussian-rasterization
+python setup.py install
+```
+
+3DGEER is AGPL-3.0; keep that in mind if you redistribute a build that links it.
 
 ## Standard Scene Format
 
@@ -199,6 +239,7 @@ If you use this code, please cite:
 - ImprovedVBGS: [arXiv:2607.15542](https://arxiv.org/abs/2607.15542)
 - VBGS: [arXiv:2410.03592](https://arxiv.org/abs/2410.03592)
 - VBGS optimization study: [arXiv:2603.08499](https://arxiv.org/abs/2603.08499)
+- 3DGEER: [arXiv:2505.24053](https://arxiv.org/abs/2505.24053) / [boschresearch/3dgeer](https://github.com/boschresearch/3dgeer)
 
 ## License
 
